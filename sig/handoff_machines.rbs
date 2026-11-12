@@ -1,0 +1,84 @@
+module HandoffMachines
+  VERSION: String
+  CAPACITY: Integer
+  WINDOW: Integer
+  PHASES: Array[Symbol]
+  REFUSALS: Array[Symbol]
+
+  type phase = :quiesce | :drain | :checkpoint | :activate | :rollback | :complete | :aborted
+  type refusal = :full | :busy | :replica_busy | :same_replica | :exhausted | :clock_regressed
+               | :stale | :unknown | :out_of_phase | :wrong_replica | :behind_base | :beyond_drain
+               | :duplicate | :out_of_window | :unacked | :mismatch | :stale_token | :fence_required
+  type action = :quiesce | :drain | :capture | :install | :fence | :activate | :resume | :discard
+
+  class Ticket < Data
+    attr_reader partition: Integer
+    attr_reader generation: Integer
+    def self.new: (Integer partition, Integer generation) -> Ticket
+                | (partition: Integer, generation: Integer) -> Ticket
+  end
+
+  class Order < Data
+    attr_reader ticket: Ticket
+    attr_reader to: Integer | :authority
+    attr_reader action: action
+    attr_reader value: Integer?
+    def self.new: (Ticket ticket, Integer | :authority to, action action, Integer? value) -> Order
+                | (ticket: Ticket, to: Integer | :authority, action: action, value: Integer?) -> Order
+  end
+
+  class Status < Data
+    attr_reader ticket: Ticket
+    attr_reader source: Integer
+    attr_reader target: Integer
+    attr_reader phase: phase
+    attr_reader base: Integer
+    attr_reader until: Integer?
+    attr_reader checkpoint: Integer?
+    attr_reader token: Integer?
+    attr_reader deadline_ns: Integer
+    def self.new: (Ticket ticket, Integer source, Integer target, phase phase, Integer base, Integer? until_offset,
+                   Integer? checkpoint, Integer? token, Integer deadline_ns) -> Status
+  end
+
+  class Coordinator
+    def self.new: (phase_budget_ns: Integer, per_replica: Integer, ?last_generation: Integer) -> Coordinator
+    def start: (Integer partition, source: Integer, target: Integer, base: Integer, token: Integer,
+                now_ns: Integer) -> (Ticket | refusal)
+    def quiesced: (Ticket, Integer replica, Integer until_offset, Integer now_ns) -> (phase | refusal)
+    def drained: (Ticket, Integer replica, Integer offset, Integer now_ns) -> (phase | refusal)
+    def committed: (Ticket, Integer replica, Integer offset, Integer now_ns) -> (phase | refusal)
+    def captured: (Ticket, Integer replica, Integer checkpoint, Integer now_ns) -> (phase | refusal)
+    def installed: (Ticket, Integer replica, Integer checkpoint, Integer now_ns) -> (phase | refusal)
+    def fenced: (Ticket, Integer token, Integer now_ns) -> (phase | refusal)
+    def activated: (Ticket, Integer replica, Integer token, Integer now_ns) -> (phase | refusal)
+    def abort: (Ticket, Integer now_ns, ?token: Integer?) -> (phase | refusal)
+    def resumed: (Ticket, Integer replica, Integer now_ns) -> (phase | refusal)
+    def discarded: (Ticket, Integer replica, Integer now_ns) -> (phase | refusal)
+    def status: (Integer partition) -> Status?
+    def orders: (?Integer from, ?limit: Integer) -> [Array[Order], Integer]
+    def outstanding: (Ticket, ?Integer from, ?limit: Integer) -> (Array[Integer] | refusal)
+    def overdue: (Integer now_ns, ?Integer from, ?limit: Integer) -> [Array[Ticket], Integer]
+    def active: () -> Integer
+    def generation: () -> Integer
+
+    private
+
+    def key: (Ticket) -> [Integer, Integer]
+    def native_start: (Integer, [Integer, Integer], Integer, Integer, Integer) -> ([Integer, Integer] | refusal)
+    def native_quiesced: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_drained: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_committed: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_captured: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_installed: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_fenced: (Integer, Integer, Integer, Integer) -> Symbol
+    def native_activated: (Integer, Integer, Integer, Integer, Integer) -> Symbol
+    def native_abort: (Integer, Integer, Integer?, Integer) -> Symbol
+    def native_resumed: (Integer, Integer, Integer, Integer) -> Symbol
+    def native_discarded: (Integer, Integer, Integer, Integer) -> Symbol
+    def native_status: (Integer) -> [Array[untyped], Array[untyped]]?
+    def native_orders: (Integer, Integer) -> [Array[Array[untyped]], Integer]
+    def native_outstanding: (Integer, Integer, Integer, Integer) -> (Array[Integer] | refusal)
+    def native_overdue: (Integer, Integer, Integer) -> [Array[[Integer, Integer]], Integer]
+  end
+end
