@@ -1,0 +1,16 @@
+{
+  "plugins": ["cargo-workspace"],
+  "packages": {
+    ".": {
+      "release-type": "ruby",
+      "package-name": "handoff_machines",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true
+    },
+    "ext/handoff_machines_native/core": {
+      "release-type": "rust",
+      "package-name": "handoff-machines",
+      "bump-minor-pre-major": true
+    }
+  }
+}
