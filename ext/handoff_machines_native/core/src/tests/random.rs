@@ -160,7 +160,7 @@ impl Run {
                 )
             }
             1 => {
-                let missing = entry.as_ref().map(|m| m.missing(0)).unwrap_or_default();
+                let missing = entry.as_ref().map_or_default(|m| m.missing(0));
                 let offset = match missing.len() as u64 {
                     count if count > 0 && d.chance(90) => {
                         let reach = if d.chance(80) { count.min(3) } else { count };
