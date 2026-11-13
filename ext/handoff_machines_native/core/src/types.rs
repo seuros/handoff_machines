@@ -17,7 +17,6 @@ pub struct Ticket {
 /// Where a transfer stands. `Complete` and `Aborted` are only ever returned
 /// from the call that ended the transfer; the slot is free afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Phase {
     /// Waiting for the source to stop admitting new work.
     Quiesce,
@@ -35,51 +34,41 @@ pub enum Phase {
     Aborted,
 }
 
-/// Why a call changed nothing.
+/// Honoured outcome of every acknowledgement. Each may be delivered more than
+/// once; the transfer answers a repeat from what it recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Refusal {
-    /// Every transfer slot is in use.
-    Full,
-    /// The partition already has a transfer in progress.
-    Busy,
-    /// The source or the target is already in its per-replica limit of transfers.
-    ReplicaBusy,
-    /// Source and target are the same replica.
-    SameReplica,
-    /// The generation space is exhausted; generations never wrap.
-    Exhausted,
-    /// `now` is earlier than the latest accepted observation.
-    ClockRegressed,
-    /// The ticket's generation was issued but is not the partition's current transfer.
-    Stale,
-    /// The ticket was never issued by this coordinator.
-    Unknown,
-    /// The transfer is not waiting for this acknowledgement.
-    OutOfPhase,
-    /// The acknowledgement came from a replica that does not hold that role.
-    WrongReplica,
-    /// The quiesce point is below the transfer's base offset.
-    BehindBase,
-    /// The offset is at or beyond the quiesce point.
-    BeyondDrain,
-    /// Already acknowledged, already confirmed, or never required.
-    Duplicate,
-    /// The offset is beyond the drain window; confirm commits to slide it.
-    OutOfWindow,
-    /// The confirmed offset is beyond the contiguous acknowledged prefix.
-    Unacked,
-    /// The checkpoint or token is not the one this transfer recorded.
-    Mismatch,
-    /// The token does not exceed every token this transfer already knows.
-    StaleToken,
-    /// Activation was ordered; aborting needs a newer fencing token.
-    FenceRequired,
+pub enum Acked {
+    /// Recorded for the first time; the transfer now stands at this phase.
+    Recorded(Phase),
+    /// Idempotent repeat: the transfer already recorded this acknowledgement
+    /// with the same payload (quiesce point, offset, checkpoint, token), or
+    /// the rollback never owed it. Nothing changed, not even the observed
+    /// clock; the transfer still stands at this phase, which may be a later
+    /// one than the acknowledgement first led to.
+    Duplicate(Phase),
+}
+
+impl Acked {
+    /// Where the transfer stands after the call.
+    #[must_use]
+    pub const fn phase(self) -> Phase {
+        match self {
+            Self::Recorded(phase) | Self::Duplicate(phase) => phase,
+        }
+    }
+
+    /// Whether the call was an idempotent repeat that changed nothing.
+    #[must_use]
+    pub const fn is_duplicate(self) -> bool {
+        match self {
+            Self::Recorded(_) => false,
+            Self::Duplicate(_) => true,
+        }
+    }
 }
 
 /// Who an order is addressed to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Recipient {
     /// A replica, by its caller-owned durable identity.
     Replica(u64),
@@ -89,7 +78,6 @@ pub enum Recipient {
 
 /// What the recipient is asked to do. Orders are restated until acknowledged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Action {
     /// Source: stop admitting new work and report the quiesce point.
     Quiesce,

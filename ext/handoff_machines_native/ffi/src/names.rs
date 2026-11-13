@@ -1,5 +1,5 @@
 //! Symbol names for the core's phases, refusals and orders.
-use handoff_machines::{Action, FencingToken, Order, Phase, Recipient, Refusal};
+use handoff_machines::{Acked, Action, FencingToken, Order, Phase, Recipient, Refusal};
 use magnus::{IntoValue, Ruby, Symbol, Value, prelude::*};
 
 pub const PHASES: [&str; 7] = [
@@ -12,7 +12,7 @@ pub const PHASES: [&str; 7] = [
     "aborted",
 ];
 
-pub const REFUSALS: [&str; 18] = [
+pub const REFUSALS: [&str; 17] = [
     "full",
     "busy",
     "replica_busy",
@@ -25,7 +25,6 @@ pub const REFUSALS: [&str; 18] = [
     "wrong_replica",
     "behind_base",
     "beyond_drain",
-    "duplicate",
     "out_of_window",
     "unacked",
     "mismatch",
@@ -41,7 +40,7 @@ pub const fn phase(phase: Phase) -> &'static str {
         Phase::Activate => "activate",
         Phase::Rollback => "rollback",
         Phase::Complete => "complete",
-        _ => "aborted",
+        Phase::Aborted => "aborted",
     }
 }
 
@@ -59,27 +58,31 @@ pub const fn refusal(refusal: Refusal) -> &'static str {
         Refusal::WrongReplica => "wrong_replica",
         Refusal::BehindBase => "behind_base",
         Refusal::BeyondDrain => "beyond_drain",
-        Refusal::Duplicate => "duplicate",
         Refusal::OutOfWindow => "out_of_window",
         Refusal::Unacked => "unacked",
         Refusal::Mismatch => "mismatch",
         Refusal::StaleToken => "stale_token",
-        _ => "fence_required",
+        Refusal::FenceRequired => "fence_required",
     }
 }
 
-pub const fn outcome(outcome: Result<Phase, Refusal>) -> &'static str {
+/// An acknowledgement: `[duplicate, phase]` when honoured (the Ruby side
+/// wraps it as `Recorded` or `Duplicate`), or the refusal symbol.
+pub fn acked(ruby: &Ruby, outcome: Result<Acked, Refusal>) -> Value {
+    let symbol = |name| ruby.to_symbol(name);
     match outcome {
-        Ok(next) => phase(next),
-        Err(refused) => refusal(refused),
+        Ok(Acked::Recorded(reached)) => (false, symbol(phase(reached))).into_value_with(ruby),
+        Ok(Acked::Duplicate(stands)) => (true, symbol(phase(stands))).into_value_with(ruby),
+        Err(refused) => symbol(refusal(refused)).as_value(),
     }
 }
 
-/// Recipient (replica Integer or `:authority`), action name and its operand.
+/// Recipient (replica Integer or `:authority`), action name and its field;
+/// the Ruby side wraps them as `Replica` and the action `Data` values.
 pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
     let to = match order.to {
         Recipient::Replica(replica) => replica.into_value_with(ruby),
-        _ => ruby.to_symbol("authority").as_value(),
+        Recipient::Authority => ruby.to_symbol("authority").as_value(),
     };
     let (name, value) = match order.action {
         Action::Quiesce => ("quiesce", None),
@@ -89,7 +92,7 @@ pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
         Action::Fence { above } => ("fence", Some(above.value())),
         Action::Activate { token } => ("activate", Some(token.value())),
         Action::Resume { token } => ("resume", token.map(FencingToken::value)),
-        _ => ("discard", None),
+        Action::Discard => ("discard", None),
     };
     (to, ruby.to_symbol(name), value)
 }

@@ -3,10 +3,24 @@ use std::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use super::model::{Model, Wait};
 use super::{LIMITS, token};
-use crate::{Duration, Handoff, Order, Phase, Refusal, Ticket};
+use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Ticket};
 
 const N: usize = 4;
 const WORDS: usize = 1;
+
+/// Acknowledgement kinds, in the order `Run::ack` numbers them.
+const ACKS: [&str; 10] = [
+    "quiesced",
+    "drained",
+    "committed",
+    "captured",
+    "installed",
+    "fenced",
+    "activated",
+    "abort",
+    "resumed",
+    "discarded",
+];
 
 struct Draws(u64);
 
@@ -106,24 +120,26 @@ impl Run {
             let held = 1 + self.draws.below(5);
             let got = self.core.start(p, s, t, base, token(held), now);
             assert_eq!(got, self.model.start(p, s, t, base, held, now));
-            self.record(&got.map(|_| Phase::Quiesce), &before);
+            self.record(got.map(|_| Acked::Recorded(Phase::Quiesce)), &before);
             self.tickets.extend(got.ok());
         } else {
             let ticket = self.ticket();
             let got = self.ack(ticket, now);
-            self.record(&got, &before);
+            self.record(got, &before);
         }
         self.compare();
     }
 
     /// One acknowledgement: usually the one the move waits for, sometimes not.
     #[allow(clippy::too_many_lines)] // One arm per acknowledgement kind reads best in one place.
-    fn ack(&mut self, ticket: Ticket, now: Duration) -> Result<Phase, Refusal> {
+    fn ack(&mut self, ticket: Ticket, now: Duration) -> Result<Acked, Refusal> {
         let entry = self
             .model
             .lookup(ticket)
             .ok()
             .map(|i| self.model.moves[i].clone());
+        let said = entry.as_ref().and_then(|m| m.until);
+        let undo = entry.as_ref().and_then(|m| m.undo_token);
         let (source, target, base) = entry
             .as_ref()
             .map_or((0, 1, 0), |m| (m.source, m.target, m.base));
@@ -150,9 +166,12 @@ impl Run {
         };
         let (got, expected) = match choice {
             0 => {
-                let until = base
-                    .saturating_add(d.below(90))
-                    .saturating_sub(d.below(2) * d.below(2));
+                let until = match said {
+                    Some(said) if d.chance(70) => said,
+                    _ => base
+                        .saturating_add(d.below(90))
+                        .saturating_sub(d.below(2) * d.below(2)),
+                };
                 let who = by(d, source);
                 (
                     core.quiesced(ticket, who, until, now),
@@ -175,7 +194,7 @@ impl Run {
                 )
             }
             2 => {
-                let offset = base.saturating_add(d.below(6));
+                let offset = base.saturating_add(d.below(6)).saturating_sub(d.below(2));
                 let who = by(d, source);
                 (
                     core.committed(ticket, who, offset, now),
@@ -183,7 +202,8 @@ impl Run {
                 )
             }
             3 => {
-                let (who, id) = (by(d, source), d.below(9));
+                let id = near(d, entry.as_ref().and_then(|m| m.checkpoint));
+                let who = by(d, source);
                 (
                     core.captured(ticket, who, id, now),
                     model.captured(ticket, who, id, now),
@@ -200,7 +220,7 @@ impl Run {
                 )
             }
             5 => {
-                let grant = 1 + d.below(9);
+                let grant = 1 + near(d, entry.as_ref().and_then(|m| m.granted).map(|g| g - 1));
                 (
                     core.fenced(ticket, token(grant), now),
                     model.fenced(ticket, grant, now),
@@ -215,7 +235,10 @@ impl Run {
                 )
             }
             7 => {
-                let fence = d.chance(50).then(|| 1 + d.below(12));
+                let fence = match undo {
+                    Some(_) if d.chance(60) => undo,
+                    _ => d.chance(50).then(|| 1 + d.below(12)),
+                };
                 (
                     core.abort(ticket, fence.map(token), now),
                     model.abort(ticket, fence, now),
@@ -240,16 +263,19 @@ impl Run {
             got, expected,
             "choice {choice} on {ticket:?} waiting for {wait:?}"
         );
+        if got.is_ok_and(Acked::is_duplicate) {
+            self.seen
+                .insert(format!("repeat of {}", ACKS[choice.min(9) as usize]));
+        }
         got
     }
 
-    fn record<T: core::fmt::Debug>(
-        &mut self,
-        got: &Result<T, Refusal>,
-        before: &Handoff<N, WORDS>,
-    ) {
-        if got.is_err() {
-            assert_eq!(&self.core, before, "a refused call mutated state: {got:?}");
+    fn record(&mut self, got: Result<Acked, Refusal>, before: &Handoff<N, WORDS>) {
+        if !matches!(got, Ok(Acked::Recorded(_))) {
+            assert_eq!(
+                &self.core, before,
+                "a refusal or a repeat mutated state: {got:?}"
+            );
         }
         self.seen.insert(format!("{got:?}"));
     }
@@ -291,13 +317,26 @@ fn core_matches_the_naive_model_under_random_operations() {
         seen.append(&mut run.seen);
     }
     let expected = [
-        "Ok(Quiesce)",
-        "Ok(Drain)",
-        "Ok(Checkpoint)",
-        "Ok(Activate)",
-        "Ok(Rollback)",
-        "Ok(Complete)",
-        "Ok(Aborted)",
+        "Ok(Recorded(Quiesce))",
+        "Ok(Recorded(Drain))",
+        "Ok(Recorded(Checkpoint))",
+        "Ok(Recorded(Activate))",
+        "Ok(Recorded(Rollback))",
+        "Ok(Recorded(Complete))",
+        "Ok(Recorded(Aborted))",
+        "Ok(Duplicate(Drain))",
+        "Ok(Duplicate(Checkpoint))",
+        "Ok(Duplicate(Activate))",
+        "Ok(Duplicate(Rollback))",
+        "repeat of quiesced",
+        "repeat of drained",
+        "repeat of committed",
+        "repeat of captured",
+        "repeat of installed",
+        "repeat of fenced",
+        "repeat of abort",
+        "repeat of resumed",
+        "repeat of discarded",
         "Err(Full)",
         "Err(Busy)",
         "Err(ReplicaBusy)",
@@ -309,13 +348,13 @@ fn core_matches_the_naive_model_under_random_operations() {
         "Err(WrongReplica)",
         "Err(BehindBase)",
         "Err(BeyondDrain)",
-        "Err(Duplicate)",
         "Err(OutOfWindow)",
         "Err(Unacked)",
         "Err(Mismatch)",
         "Err(StaleToken)",
         "Err(FenceRequired)",
     ];
+    assert!(!seen.contains("repeat of activated"), "it frees the slot");
     for outcome in expected {
         assert!(
             seen.contains(outcome),

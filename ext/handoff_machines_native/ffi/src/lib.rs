@@ -4,11 +4,9 @@ mod names;
 
 use std::{cell::RefCell, time::Duration};
 
-use handoff_machines::{FencingToken, Handoff, Limits, Phase, Refusal, Ticket};
-use magnus::scan_args::{get_kwargs, scan_args};
+use handoff_machines::{Acked, FencingToken, Limits, Refusal, Ticket};
 use magnus::{
-    Error, Integer, IntoValue, RArray, RHash, Ruby, Symbol, TryConvert, Value, prelude::*,
-    typed_data::Obj,
+    Error, Integer, IntoValue, RArray, Ruby, TryConvert, Value, prelude::*, typed_data::Obj,
 };
 
 /// Concurrent transfers compiled into the binding.
@@ -16,8 +14,8 @@ const CAPACITY: usize = 16;
 /// Drain window words: 64 offsets each.
 const WORDS: usize = 4;
 
-type Core = Handoff<CAPACITY, WORDS>;
-type Outcome = Result<Phase, Refusal>;
+type Core = handoff_machines::Handoff<CAPACITY, WORDS>;
+type Outcome = Result<Acked, Refusal>;
 
 #[derive(Clone, Copy)]
 struct Number(u64);
@@ -50,10 +48,6 @@ impl Number {
     }
 }
 
-fn nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
 const fn ticket(partition: Number, generation: Number) -> Ticket {
     Ticket {
         partition: partition.0,
@@ -61,28 +55,30 @@ const fn ticket(partition: Number, generation: Number) -> Ticket {
     }
 }
 
-#[magnus::wrap(class = "HandoffMachines::Coordinator", free_immediately, size)]
-struct Coordinator {
+#[magnus::wrap(class = "HandoffMachines::Handoff", free_immediately, size)]
+struct Handoff {
     core: RefCell<Core>,
 }
 
-impl Coordinator {
-    fn new(ruby: &Ruby, args: &[Value]) -> Result<Self, Error> {
-        let args = scan_args::<(), (), (), (), RHash, ()>(args)?;
-        let kwargs = get_kwargs::<_, (Number, Number), (Option<Number>,), ()>(
-            args.keywords,
-            &["phase_budget_ns", "per_replica"],
-            &["last_generation"],
-        )?;
-        let (budget, per_replica) = kwargs.required;
-        let (last,) = kwargs.optional;
+impl Handoff {
+    fn restored(
+        ruby: &Ruby,
+        phase_budget: Number,
+        per_replica: Number,
+        last_generation: Number,
+    ) -> Result<Self, Error> {
         let limits = Limits {
-            phase_budget: budget.at(),
+            phase_budget: phase_budget.at(),
             per_replica: per_replica.index(ruby)?,
         };
         Ok(Self {
-            core: RefCell::new(Core::restored(limits, last.map_or(0, |last| last.0))),
+            core: RefCell::new(Core::restored(limits, last_generation.0)),
         })
+    }
+
+    fn limits(&self) -> (u128, usize) {
+        let limits = self.core.borrow().limits();
+        (limits.phase_budget.as_nanos(), limits.per_replica)
     }
 
     fn start(
@@ -91,11 +87,11 @@ impl Coordinator {
         partition: Number,
         replicas: (Number, Number),
         base: Number,
-        held: Number,
+        source_token: Number,
         now: Number,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let held = held.token(ruby)?;
+        let held = source_token.token(ruby)?;
         let (source, target) = replicas;
         let started =
             this.core
@@ -107,14 +103,16 @@ impl Coordinator {
         })
     }
 
+    /// Every acknowledgement: `[duplicate, phase]` when honoured, or the
+    /// refusal symbol.
     fn ack(
         ruby: &Ruby,
         this: Obj<Self>,
         ack: impl FnOnce(&mut Core) -> Outcome,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         this.check_frozen()?;
         let outcome = ack(&mut this.core.borrow_mut());
-        Ok(ruby.to_symbol(names::outcome(outcome)))
+        Ok(names::acked(ruby, outcome))
     }
 
     fn quiesced(
@@ -125,7 +123,7 @@ impl Coordinator {
         replica: Number,
         until: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.quiesced(ticket, replica.0, until.0, now.at())
@@ -140,7 +138,7 @@ impl Coordinator {
         replica: Number,
         offset: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.drained(ticket, replica.0, offset.0, now.at())
@@ -155,7 +153,7 @@ impl Coordinator {
         replica: Number,
         offset: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.committed(ticket, replica.0, offset.0, now.at())
@@ -170,7 +168,7 @@ impl Coordinator {
         replica: Number,
         checkpoint: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.captured(ticket, replica.0, checkpoint.0, now.at())
@@ -185,7 +183,7 @@ impl Coordinator {
         replica: Number,
         checkpoint: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.installed(ticket, replica.0, checkpoint.0, now.at())
@@ -199,7 +197,7 @@ impl Coordinator {
         generation: Number,
         token: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let (ticket, token) = (ticket(partition, generation), token.token(ruby)?);
         Self::ack(ruby, this, |core| core.fenced(ticket, token, now.at()))
     }
@@ -212,7 +210,7 @@ impl Coordinator {
         replica: Number,
         token: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let (ticket, token) = (ticket(partition, generation), token.token(ruby)?);
         Self::ack(ruby, this, |core| {
             core.activated(ticket, replica.0, token, now.at())
@@ -226,7 +224,7 @@ impl Coordinator {
         generation: Number,
         token: Option<Number>,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         let token = token.map(|token| token.token(ruby)).transpose()?;
         Self::ack(ruby, this, |core| core.abort(ticket, token, now.at()))
@@ -239,7 +237,7 @@ impl Coordinator {
         generation: Number,
         replica: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| core.resumed(ticket, replica.0, now.at()))
     }
@@ -251,7 +249,7 @@ impl Coordinator {
         generation: Number,
         replica: Number,
         now: Number,
-    ) -> Result<Symbol, Error> {
+    ) -> Result<Value, Error> {
         let ticket = ticket(partition, generation);
         Self::ack(ruby, this, |core| {
             core.discarded(ticket, replica.0, now.at())
@@ -272,7 +270,7 @@ impl Coordinator {
             status.until,
             status.checkpoint,
             status.token.map(FencingToken::value),
-            nanos(status.deadline),
+            status.deadline.as_nanos(),
         );
         Some((head, tail).into_value_with(ruby))
     }

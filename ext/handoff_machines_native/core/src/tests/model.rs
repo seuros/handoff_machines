@@ -1,7 +1,7 @@
 //! A deliberately naive, allocating restatement of the handoff rules.
 use std::{collections::BTreeSet, vec::Vec};
 
-use crate::{Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
+use crate::{Acked, Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
 
 use super::token;
 
@@ -28,6 +28,7 @@ pub struct Move {
     pub acked: BTreeSet<u64>,
     pub checkpoint: Option<u64>,
     pub granted: Option<u64>,
+    pub installed: bool,
     pub undo_token: Option<u64>,
     pub owes_resume: bool,
     pub owes_discard: bool,
@@ -69,7 +70,17 @@ pub struct Model {
     pub window: u64,
 }
 
-type Outcome = Result<Phase, Refusal>;
+type Outcome = Result<Acked, Refusal>;
+
+/// What a rule answers after an honoured acknowledgement.
+enum End {
+    /// Recorded; the move goes on.
+    No,
+    /// Recorded; the move ended in this phase.
+    Yes(Phase),
+    /// An idempotent repeat: the rule touched nothing.
+    Repeat,
+}
 
 impl Model {
     pub fn start(
@@ -120,6 +131,7 @@ impl Model {
             acked: BTreeSet::new(),
             checkpoint: None,
             granted: None,
+            installed: false,
             undo_token: None,
             owes_resume: false,
             owes_discard: false,
@@ -141,28 +153,34 @@ impl Model {
         &mut self,
         ticket: Ticket,
         now: Duration,
-        rule: impl FnOnce(&mut Move, u64) -> Result<Option<Phase>, Refusal>,
+        rule: impl FnOnce(&mut Move, u64) -> Result<End, Refusal>,
     ) -> Outcome {
         if now < self.seen {
             return Err(Refusal::ClockRegressed);
         }
         let index = self.lookup(ticket)?;
         let before = self.moves[index].wait;
-        let ended = rule(&mut self.moves[index], self.window)?;
-        self.seen = now;
-        if let Some(phase) = ended {
-            self.moves.remove(index);
-            return Ok(phase);
+        match rule(&mut self.moves[index], self.window)? {
+            End::Repeat => return Ok(Acked::Duplicate(self.moves[index].phase())),
+            End::Yes(phase) => {
+                self.seen = now;
+                self.moves.remove(index);
+                return Ok(Acked::Recorded(phase));
+            }
+            End::No => self.seen = now,
         }
         let entry = &mut self.moves[index];
         if entry.wait != before {
             entry.deadline = now.saturating_add(self.limits.phase_budget);
         }
-        Ok(entry.phase())
+        Ok(Acked::Recorded(entry.phase()))
     }
 
     pub fn quiesced(&mut self, ticket: Ticket, replica: u64, until: u64, now: Duration) -> Outcome {
         self.on(ticket, now, |m, _| {
+            if let Some(recorded) = m.until {
+                return replay(replica == m.source, recorded == until);
+            }
             check(m.wait == Wait::Quiesce, Refusal::OutOfPhase)?;
             check(replica == m.source, Refusal::WrongReplica)?;
             check(until >= m.base, Refusal::BehindBase)?;
@@ -172,25 +190,25 @@ impl Model {
             } else {
                 Wait::Drain
             };
-            Ok(None)
+            Ok(End::No)
         })
     }
 
     pub fn drained(&mut self, ticket: Ticket, replica: u64, offset: u64, now: Duration) -> Outcome {
         self.on(ticket, now, |m, window| {
-            check(m.wait == Wait::Drain, Refusal::OutOfPhase)?;
+            check(m.until.is_some(), Refusal::OutOfPhase)?;
             check(replica == m.source, Refusal::WrongReplica)?;
             check(Some(offset) < m.until, Refusal::BeyondDrain)?;
-            check(
-                offset >= m.base && !m.acked.contains(&offset),
-                Refusal::Duplicate,
-            )?;
+            if offset < m.base || m.acked.contains(&offset) {
+                return Ok(End::Repeat);
+            }
+            check(m.wait == Wait::Drain, Refusal::OutOfPhase)?;
             check(offset - m.base < window, Refusal::OutOfWindow)?;
             m.acked.insert(offset);
             if Some(m.prefix()) == m.until {
                 m.wait = Wait::Capture;
             }
-            Ok(None)
+            Ok(End::No)
         })
     }
 
@@ -202,13 +220,16 @@ impl Model {
         now: Duration,
     ) -> Outcome {
         self.on(ticket, now, |m, _| {
-            check(m.wait == Wait::Drain, Refusal::OutOfPhase)?;
+            check(m.until.is_some(), Refusal::OutOfPhase)?;
             check(replica == m.source, Refusal::WrongReplica)?;
-            check(offset > m.base, Refusal::Duplicate)?;
+            if offset <= m.base {
+                return Ok(End::Repeat);
+            }
+            check(m.wait == Wait::Drain, Refusal::OutOfPhase)?;
             check(offset <= m.prefix(), Refusal::Unacked)?;
             m.base = offset;
             m.acked.retain(|o| *o >= offset);
-            Ok(None)
+            Ok(End::No)
         })
     }
 
@@ -220,11 +241,14 @@ impl Model {
         now: Duration,
     ) -> Outcome {
         self.on(ticket, now, |m, _| {
+            if let Some(recorded) = m.checkpoint {
+                return replay(replica == m.source, recorded == checkpoint);
+            }
             check(m.wait == Wait::Capture, Refusal::OutOfPhase)?;
             check(replica == m.source, Refusal::WrongReplica)?;
             m.checkpoint = Some(checkpoint);
             m.wait = Wait::Install;
-            Ok(None)
+            Ok(End::No)
         })
     }
 
@@ -236,21 +260,28 @@ impl Model {
         now: Duration,
     ) -> Outcome {
         self.on(ticket, now, |m, _| {
+            if m.installed {
+                return replay(replica == m.target, m.checkpoint == Some(checkpoint));
+            }
             check(m.wait == Wait::Install, Refusal::OutOfPhase)?;
             check(replica == m.target, Refusal::WrongReplica)?;
             check(m.checkpoint == Some(checkpoint), Refusal::Mismatch)?;
+            m.installed = true;
             m.wait = Wait::Fence;
-            Ok(None)
+            Ok(End::No)
         })
     }
 
     pub fn fenced(&mut self, ticket: Ticket, granted: u64, now: Duration) -> Outcome {
         self.on(ticket, now, |m, _| {
+            if let Some(recorded) = m.granted {
+                return replay(true, recorded == granted);
+            }
             check(m.wait == Wait::Fence, Refusal::OutOfPhase)?;
             check(granted > m.held, Refusal::StaleToken)?;
             m.granted = Some(granted);
             m.wait = Wait::Activate;
-            Ok(None)
+            Ok(End::No)
         })
     }
 
@@ -265,13 +296,15 @@ impl Model {
             check(m.wait == Wait::Activate, Refusal::OutOfPhase)?;
             check(replica == m.target, Refusal::WrongReplica)?;
             check(m.granted == Some(granted), Refusal::Mismatch)?;
-            Ok(Some(Phase::Complete))
+            Ok(End::Yes(Phase::Complete))
         })
     }
 
     pub fn abort(&mut self, ticket: Ticket, fence: Option<u64>, now: Duration) -> Outcome {
         self.on(ticket, now, |m, _| {
-            check(m.wait != Wait::Undo, Refusal::OutOfPhase)?;
+            if m.wait == Wait::Undo {
+                return replay(true, m.undo_token == fence);
+            }
             let known = m.granted.unwrap_or(m.held);
             check(fence.is_none_or(|f| f > known), Refusal::StaleToken)?;
             check(
@@ -282,7 +315,7 @@ impl Model {
             m.owes_discard = [Wait::Install, Wait::Fence, Wait::Activate].contains(&m.wait);
             m.undo_token = fence;
             m.wait = Wait::Undo;
-            Ok(None)
+            Ok(End::No)
         })
     }
 
@@ -302,10 +335,16 @@ impl Model {
             } else {
                 &mut m.owes_discard
             };
-            check(*owed, Refusal::Duplicate)?;
+            if !*owed {
+                return Ok(End::Repeat);
+            }
             *owed = false;
             let done = !m.owes_resume && !m.owes_discard;
-            Ok(done.then_some(Phase::Aborted))
+            Ok(if done {
+                End::Yes(Phase::Aborted)
+            } else {
+                End::No
+            })
         })
     }
 
@@ -339,38 +378,18 @@ impl Model {
                     action,
                 });
             };
+            let (until, checkpoint) = (m.until.unwrap_or(0), m.checkpoint.unwrap_or(0));
+            let above = token(m.held);
             match m.wait {
                 Wait::Quiesce => push(source, Action::Quiesce),
-                Wait::Drain => push(
-                    source,
-                    Action::Drain {
-                        until: m.until.unwrap(),
-                    },
-                ),
-                Wait::Capture => push(
-                    source,
-                    Action::Capture {
-                        at: m.until.unwrap(),
-                    },
-                ),
-                Wait::Install => push(
-                    target,
-                    Action::Install {
-                        checkpoint: m.checkpoint.unwrap(),
-                    },
-                ),
-                Wait::Fence => push(
-                    Recipient::Authority,
-                    Action::Fence {
-                        above: token(m.held),
-                    },
-                ),
-                Wait::Activate => push(
-                    target,
-                    Action::Activate {
-                        token: token(m.granted.unwrap()),
-                    },
-                ),
+                Wait::Drain => push(source, Action::Drain { until }),
+                Wait::Capture => push(source, Action::Capture { at: until }),
+                Wait::Install => push(target, Action::Install { checkpoint }),
+                Wait::Fence => push(Recipient::Authority, Action::Fence { above }),
+                Wait::Activate => {
+                    let token = token(m.granted.unwrap());
+                    push(target, Action::Activate { token });
+                }
                 Wait::Undo => {
                     if m.owes_resume {
                         push(
@@ -388,6 +407,14 @@ impl Model {
         }
         out
     }
+}
+
+/// A recorded acknowledgement arrives again: a repeat only from the same
+/// holder with the same payload.
+fn replay(holder: bool, same: bool) -> Result<End, Refusal> {
+    check(holder, Refusal::WrongReplica)?;
+    check(same, Refusal::Mismatch)?;
+    Ok(End::Repeat)
 }
 
 fn check(holds: bool, refusal: Refusal) -> Result<(), Refusal> {

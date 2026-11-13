@@ -6,6 +6,7 @@ use super::*;
 mod edges;
 mod model;
 mod random;
+mod replays;
 
 pub const LIMITS: Limits = Limits {
     phase_budget: Duration::from_secs(5),
@@ -21,7 +22,20 @@ pub fn token(value: u64) -> FencingToken {
 }
 
 pub type Small = Handoff<2, 1>;
-type Ack<'a> = dyn Fn(&mut Small) -> Result<Phase, Refusal> + 'a;
+type Answer = Result<Acked, Refusal>;
+type Ack<'a> = dyn Fn(&mut Small) -> Answer + 'a;
+
+/// The acknowledgement was recorded and the transfer stands at `phase`.
+#[allow(clippy::unnecessary_wraps)] // Compared against whole answers.
+pub const fn recorded(phase: Phase) -> Answer {
+    Ok(Acked::Recorded(phase))
+}
+
+/// An idempotent repeat: honoured, and nothing changed.
+#[allow(clippy::unnecessary_wraps)] // Compared against whole answers.
+pub const fn repeat(phase: Phase) -> Answer {
+    Ok(Acked::Duplicate(phase))
+}
 
 fn orders<const N: usize, const W: usize>(handoff: &Handoff<N, W>) -> Vec<(Recipient, Action)> {
     handoff.orders(0).map(|o| (o.to, o.action)).collect()
@@ -38,7 +52,7 @@ pub fn begun() -> (Small, Ticket) {
 }
 
 /// Advance a fresh transfer through `steps` acknowledgements of the happy path.
-fn advanced(steps: usize) -> (Small, Ticket) {
+pub fn advanced(steps: usize) -> (Small, Ticket) {
     let (mut h, t) = begun();
     let acks: [&Ack; 6] = [
         &|h| h.quiesced(t, 1, 12, at(1)),
@@ -63,25 +77,28 @@ fn happy_path_walks_every_phase_and_restates_orders() {
     assert_eq!((t.partition, t.generation), (9, 1));
     assert_eq!(orders(&h), [(SOURCE, Action::Quiesce)]);
     assert_eq!(orders(&h), [(SOURCE, Action::Quiesce)]);
-    assert_eq!(h.quiesced(t, 1, 12, at(1)), Ok(Phase::Drain));
+    assert_eq!(h.quiesced(t, 1, 12, at(1)), recorded(Phase::Drain));
     assert_eq!(orders(&h), [(SOURCE, Action::Drain { until: 12 })]);
-    assert_eq!(h.drained(t, 1, 11, at(1)), Ok(Phase::Drain));
+    assert_eq!(h.drained(t, 1, 11, at(1)), recorded(Phase::Drain));
     assert_eq!(h.outstanding(t, 0).unwrap().collect::<Vec<_>>(), [10]);
-    assert_eq!(h.drained(t, 1, 10, at(2)), Ok(Phase::Checkpoint));
+    assert_eq!(h.drained(t, 1, 10, at(2)), recorded(Phase::Checkpoint));
     assert_eq!(orders(&h), [(SOURCE, Action::Capture { at: 12 })]);
-    assert_eq!(h.captured(t, 1, 77, at(2)), Ok(Phase::Checkpoint));
+    assert_eq!(h.captured(t, 1, 77, at(2)), recorded(Phase::Checkpoint));
     assert_eq!(orders(&h), [(TARGET, Action::Install { checkpoint: 77 })]);
-    assert_eq!(h.installed(t, 2, 77, at(3)), Ok(Phase::Activate));
+    assert_eq!(h.installed(t, 2, 77, at(3)), recorded(Phase::Activate));
     let fence = Action::Fence { above: token(5) };
     assert_eq!(orders(&h), [(Recipient::Authority, fence)]);
-    assert_eq!(h.fenced(t, token(6), at(3)), Ok(Phase::Activate));
+    assert_eq!(h.fenced(t, token(6), at(3)), recorded(Phase::Activate));
     assert_eq!(orders(&h), [(TARGET, Action::Activate { token: token(6) })]);
     let status = h.status(9).unwrap();
     assert_eq!((status.ticket, status.source, status.target), (t, 1, 2));
     assert_eq!((status.phase, status.base), (Phase::Activate, 10));
     assert_eq!((status.until, status.checkpoint), (Some(12), Some(77)));
     assert_eq!((status.token, status.deadline), (Some(token(6)), at(8)));
-    assert_eq!(h.activated(t, 2, token(6), at(4)), Ok(Phase::Complete));
+    assert_eq!(
+        h.activated(t, 2, token(6), at(4)),
+        recorded(Phase::Complete)
+    );
     assert_eq!((h.active(), h.status(9), orders(&h).len()), (0, None, 0));
     assert_eq!(h.activated(t, 2, token(6), at(4)), Err(Refusal::Stale));
 }
@@ -90,7 +107,7 @@ fn happy_path_walks_every_phase_and_restates_orders() {
 fn empty_drain_skips_to_checkpoint() {
     let (mut h, t) = begun();
     assert_eq!(h.quiesced(t, 1, 9, at(0)), Err(Refusal::BehindBase));
-    assert_eq!(h.quiesced(t, 1, 10, at(0)), Ok(Phase::Checkpoint));
+    assert_eq!(h.quiesced(t, 1, 10, at(0)), recorded(Phase::Checkpoint));
     assert_eq!(h.status(9).unwrap().until, Some(10));
     assert_eq!(h.outstanding(t, 0).err(), Some(Refusal::OutOfPhase));
 }
@@ -108,9 +125,7 @@ fn abort_rolls_back_from_each_phase() {
     for (steps, phase, discard) in cases {
         let (mut h, t) = advanced(steps);
         assert_eq!(h.status(9).unwrap().phase, phase);
-        assert_eq!(h.abort(t, None, at(2)), Ok(Phase::Rollback));
-        assert_eq!(h.abort(t, None, at(2)), Err(Refusal::OutOfPhase));
-        assert_eq!(h.quiesced(t, 1, 12, at(2)), Err(Refusal::OutOfPhase));
+        assert_eq!(h.abort(t, None, at(2)), recorded(Phase::Rollback));
         let mut owed = Vec::from([(SOURCE, Action::Resume { token: None })]);
         if discard {
             owed.push((TARGET, Action::Discard));
@@ -119,13 +134,19 @@ fn abort_rolls_back_from_each_phase() {
         assert_eq!(h.resumed(t, 2, at(2)), Err(Refusal::WrongReplica));
         assert_eq!(h.discarded(t, 1, at(2)), Err(Refusal::WrongReplica));
         if discard {
-            assert_eq!(h.resumed(t, 1, at(2)), Ok(Phase::Rollback));
-            assert_eq!(h.resumed(t, 1, at(2)), Err(Refusal::Duplicate));
+            assert_eq!(h.resumed(t, 1, at(2)), recorded(Phase::Rollback));
+            let before = h.clone();
+            let again = h.resumed(t, 1, at(9));
+            assert_eq!(again, repeat(Phase::Rollback));
+            assert_eq!(h, before, "a repeat changes nothing, not even the clock");
             assert_eq!(orders(&h), [(TARGET, Action::Discard)]);
-            assert_eq!(h.discarded(t, 2, at(3)), Ok(Phase::Aborted));
+            assert_eq!(h.discarded(t, 2, at(3)), recorded(Phase::Aborted));
         } else {
-            assert_eq!(h.discarded(t, 2, at(2)), Err(Refusal::Duplicate));
-            assert_eq!(h.resumed(t, 1, at(3)), Ok(Phase::Aborted));
+            let before = h.clone();
+            let unowed = h.discarded(t, 2, at(9));
+            assert_eq!(unowed, repeat(Phase::Rollback));
+            assert_eq!(h, before, "a discard never owed changes nothing");
+            assert_eq!(h.resumed(t, 1, at(3)), recorded(Phase::Aborted));
         }
         assert_eq!((h.active(), h.status(9)), (0, None));
         assert_eq!(h.resumed(t, 1, at(3)), Err(Refusal::Stale));
@@ -139,15 +160,15 @@ fn abort_after_activation_was_ordered_needs_a_newer_token() {
     assert_eq!(h.abort(t, None, at(2)), Err(Refusal::FenceRequired));
     assert_eq!(h.abort(t, Some(token(6)), at(2)), Err(Refusal::StaleToken));
     assert_eq!(h, before);
-    assert_eq!(h.abort(t, Some(token(7)), at(2)), Ok(Phase::Rollback));
+    assert_eq!(h.abort(t, Some(token(7)), at(2)), recorded(Phase::Rollback));
     let resume = Action::Resume {
         token: Some(token(7)),
     };
     assert_eq!(orders(&h), [(SOURCE, resume), (TARGET, Action::Discard)]);
     assert_eq!(h.activated(t, 2, token(6), at(2)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.discarded(t, 2, at(2)), Ok(Phase::Rollback));
+    assert_eq!(h.discarded(t, 2, at(2)), recorded(Phase::Rollback));
     assert_eq!(orders(&h), [(SOURCE, resume)]);
-    assert_eq!(h.resumed(t, 1, at(2)), Ok(Phase::Aborted));
+    assert_eq!(h.resumed(t, 1, at(2)), recorded(Phase::Aborted));
     assert_eq!(h.active(), 0);
 }
 
@@ -155,7 +176,7 @@ fn abort_after_activation_was_ordered_needs_a_newer_token() {
 fn fenced_abort_is_allowed_early_and_checks_the_source_token() {
     let (mut h, t) = advanced(1);
     assert_eq!(h.abort(t, Some(token(5)), at(2)), Err(Refusal::StaleToken));
-    assert_eq!(h.abort(t, Some(token(9)), at(2)), Ok(Phase::Rollback));
+    assert_eq!(h.abort(t, Some(token(9)), at(2)), recorded(Phase::Rollback));
     let resume = Action::Resume {
         token: Some(token(9)),
     };
@@ -196,7 +217,7 @@ fn stale_generation_acknowledgements_are_refused() {
         assert_eq!(h.outstanding(ticket, 0).err(), Some(refusal));
     }
     assert_eq!(h, before);
-    assert_eq!(h.quiesced(new, 1, 12, at(1)), Ok(Phase::Drain));
+    assert_eq!(h.quiesced(new, 1, 12, at(1)), recorded(Phase::Drain));
 }
 
 #[test]
@@ -218,13 +239,20 @@ fn acknowledgements_must_match_phase_replica_and_evidence() {
     let before = h.clone();
     assert_eq!(h.drained(t, 2, 10, at(1)), Err(Refusal::WrongReplica));
     assert_eq!(h.drained(t, 1, 12, at(1)), Err(Refusal::BeyondDrain));
-    assert_eq!(h.drained(t, 1, 9, at(1)), Err(Refusal::Duplicate));
+    let below = h.drained(t, 1, 9, at(7));
+    assert_eq!(below, repeat(Phase::Drain), "below the base");
     assert_eq!(h.committed(t, 2, 11, at(1)), Err(Refusal::WrongReplica));
     assert_eq!(h.committed(t, 1, 11, at(1)), Err(Refusal::Unacked));
-    assert_eq!(h.committed(t, 1, 10, at(1)), Err(Refusal::Duplicate));
-    assert_eq!(h, before);
-    assert_eq!(h.drained(t, 1, 10, at(1)), Ok(Phase::Drain));
-    assert_eq!(h.drained(t, 1, 10, at(1)), Err(Refusal::Duplicate));
+    let settled = h.committed(t, 1, 10, at(7));
+    assert_eq!(settled, repeat(Phase::Drain));
+    assert_eq!(h, before, "refusals and repeats change nothing");
+    assert_eq!(h.drained(t, 1, 10, at(1)), recorded(Phase::Drain));
+    let before = h.clone();
+    let again = h.drained(t, 1, 10, at(7));
+    assert_eq!(again, repeat(Phase::Drain));
+    assert!(again.is_ok_and(Acked::is_duplicate));
+    assert_eq!(again.map(Acked::phase), Ok(Phase::Drain));
+    assert_eq!(h, before, "a repeat changes nothing, not even the clock");
 
     let (mut h, t) = advanced(2);
     assert_eq!(h.captured(t, 2, 77, at(1)), Err(Refusal::WrongReplica));
@@ -245,7 +273,7 @@ fn acknowledgements_must_match_phase_replica_and_evidence() {
         Err(Refusal::WrongReplica)
     );
     assert_eq!(h.activated(t, 2, token(7), at(1)), Err(Refusal::Mismatch));
-    assert_eq!(h.fenced(t, token(8), at(1)), Err(Refusal::OutOfPhase));
+    assert_eq!(h.fenced(t, token(8), at(1)), Err(Refusal::Mismatch));
     assert_eq!(h, before);
 }
 

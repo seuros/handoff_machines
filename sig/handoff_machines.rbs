@@ -5,11 +5,38 @@ module HandoffMachines
   PHASES: Array[Symbol]
   REFUSALS: Array[Symbol]
 
+  # Integer nanoseconds on one monotonic clock, for instants (now, deadline)
+  # and spans (phase_budget) alike:
+  # Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond). A non-Integer
+  # raises TypeError; a value outside 0..2**64-1 raises RangeError.
+  type nanoseconds = Integer
   type phase = :quiesce | :drain | :checkpoint | :activate | :rollback | :complete | :aborted
+  # Every symbol that means "this call was not honoured and changed nothing":
+  # one per core `Refusal` variant, no catch-all. Each method below lists
+  # exactly the ones it can answer.
   type refusal = :full | :busy | :replica_busy | :same_replica | :exhausted | :clock_regressed
                | :stale | :unknown | :out_of_phase | :wrong_replica | :behind_base | :beyond_drain
-               | :duplicate | :out_of_window | :unacked | :mismatch | :stale_token | :fence_required
-  type action = :quiesce | :drain | :capture | :install | :fence | :activate | :resume | :discard
+               | :out_of_window | :unacked | :mismatch | :stale_token | :fence_required
+  # Refusals every acknowledgement can answer for its ticket and clock.
+  type ticket_refusal = :clock_regressed | :stale | :unknown
+  # Honoured acknowledgement, the core's `Acked`. Recorded: the transfer now
+  # stands at `phase`. Duplicate: an idempotent repeat of an acknowledgement
+  # the transfer already recorded with the same payload (or, for discarded,
+  # never owed); nothing changed, not even the clock, and the transfer still
+  # stands at `phase`. A replay with a different payload is :mismatch;
+  # :out_of_phase means not awaited and never recorded.
+  type acked = Recorded | Duplicate
+  # The core's `Recipient`: Replica(id), or :authority.
+  type recipient = Replica | :authority
+  # The core's `Action`: a Data per variant with a field, a symbol otherwise.
+  type action = :quiesce | Drain | Capture | Install | Fence | Activate | Resume | :discard
+
+  class Limits < Data
+    attr_reader phase_budget: nanoseconds
+    attr_reader per_replica: Integer
+    def self.new: (nanoseconds phase_budget, Integer per_replica) -> Limits
+                | (phase_budget: nanoseconds, per_replica: Integer) -> Limits
+  end
 
   class Ticket < Data
     attr_reader partition: Integer
@@ -18,13 +45,73 @@ module HandoffMachines
                 | (partition: Integer, generation: Integer) -> Ticket
   end
 
+  class Recorded < Data
+    attr_reader phase: phase
+    def self.new: (phase phase) -> Recorded
+                | (phase: phase) -> Recorded
+    def duplicate?: () -> false
+  end
+
+  class Duplicate < Data
+    attr_reader phase: phase
+    def self.new: (phase phase) -> Duplicate
+                | (phase: phase) -> Duplicate
+    def duplicate?: () -> true
+  end
+
+  class Replica < Data
+    attr_reader id: Integer
+    def self.new: (Integer id) -> Replica
+                | (id: Integer) -> Replica
+  end
+
+  # Source: finish in-flight offsets below `until` and acknowledge each.
+  class Drain < Data
+    attr_reader until: Integer
+    def self.new: (Integer until_offset) -> Drain
+  end
+
+  # Source: capture a checkpoint at exactly `at`.
+  class Capture < Data
+    attr_reader at: Integer
+    def self.new: (Integer at) -> Capture
+                | (at: Integer) -> Capture
+  end
+
+  # Target: install the named checkpoint.
+  class Install < Data
+    attr_reader checkpoint: Integer
+    def self.new: (Integer checkpoint) -> Install
+                | (checkpoint: Integer) -> Install
+  end
+
+  # Authority: issue the target a token strictly greater than `above`.
+  class Fence < Data
+    attr_reader above: Integer
+    def self.new: (Integer above) -> Fence
+                | (above: Integer) -> Fence
+  end
+
+  # Target: start serving under `token`.
+  class Activate < Data
+    attr_reader token: Integer
+    def self.new: (Integer token) -> Activate
+                | (token: Integer) -> Activate
+  end
+
+  # Source: resume serving; under `token` when the rollback was fenced.
+  class Resume < Data
+    attr_reader token: Integer?
+    def self.new: (Integer? token) -> Resume
+                | (token: Integer?) -> Resume
+  end
+
   class Order < Data
     attr_reader ticket: Ticket
-    attr_reader to: Integer | :authority
+    attr_reader to: recipient
     attr_reader action: action
-    attr_reader value: Integer?
-    def self.new: (Ticket ticket, Integer | :authority to, action action, Integer? value) -> Order
-                | (ticket: Ticket, to: Integer | :authority, action: action, value: Integer?) -> Order
+    def self.new: (Ticket ticket, recipient to, action action) -> Order
+                | (ticket: Ticket, to: recipient, action: action) -> Order
   end
 
   class Status < Data
@@ -36,46 +123,77 @@ module HandoffMachines
     attr_reader until: Integer?
     attr_reader checkpoint: Integer?
     attr_reader token: Integer?
-    attr_reader deadline_ns: Integer
+    attr_reader deadline: nanoseconds
     def self.new: (Ticket ticket, Integer source, Integer target, phase phase, Integer base, Integer? until_offset,
-                   Integer? checkpoint, Integer? token, Integer deadline_ns) -> Status
+                   Integer? checkpoint, Integer? token, nanoseconds deadline) -> Status
   end
 
-  class Coordinator
-    def self.new: (phase_budget_ns: Integer, per_replica: Integer, ?last_generation: Integer) -> Coordinator
-    def start: (Integer partition, source: Integer, target: Integer, base: Integer, token: Integer,
-                now_ns: Integer) -> (Ticket | refusal)
-    def quiesced: (Ticket, Integer replica, Integer until_offset, Integer now_ns) -> (phase | refusal)
-    def drained: (Ticket, Integer replica, Integer offset, Integer now_ns) -> (phase | refusal)
-    def committed: (Ticket, Integer replica, Integer offset, Integer now_ns) -> (phase | refusal)
-    def captured: (Ticket, Integer replica, Integer checkpoint, Integer now_ns) -> (phase | refusal)
-    def installed: (Ticket, Integer replica, Integer checkpoint, Integer now_ns) -> (phase | refusal)
-    def fenced: (Ticket, Integer token, Integer now_ns) -> (phase | refusal)
-    def activated: (Ticket, Integer replica, Integer token, Integer now_ns) -> (phase | refusal)
-    def abort: (Ticket, Integer now_ns, ?token: Integer?) -> (phase | refusal)
-    def resumed: (Ticket, Integer replica, Integer now_ns) -> (phase | refusal)
-    def discarded: (Ticket, Integer replica, Integer now_ns) -> (phase | refusal)
+  # The core's `Handoff<16, 4>`. Honoured answers come first in every return
+  # type, then the refusals that method can answer.
+  class Handoff
+    def self.new: (Limits limits) -> Handoff
+    def self.restored: (Limits limits, Integer last_generation) -> Handoff
+    def limits: () -> Limits
+    def start: (Integer partition, Integer source, Integer target, Integer base, Integer source_token,
+                nanoseconds now)
+               -> (Ticket | :clock_regressed | :same_replica | :busy | :full | :replica_busy | :exhausted)
+    # Recorded(:drain | :checkpoint), or Duplicate.
+    def quiesced: (Ticket ticket, Integer replica, Integer until_offset, nanoseconds now)
+                  -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :behind_base | :mismatch)
+    # Recorded(:drain | :checkpoint), or Duplicate.
+    def drained: (Ticket ticket, Integer replica, Integer offset, nanoseconds now)
+                 -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :beyond_drain | :out_of_window)
+    # Recorded(:drain), or Duplicate.
+    def committed: (Ticket ticket, Integer replica, Integer offset, nanoseconds now)
+                   -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :unacked)
+    # Recorded(:checkpoint), or Duplicate.
+    def captured: (Ticket ticket, Integer replica, Integer checkpoint, nanoseconds now)
+                  -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :mismatch)
+    # Recorded(:activate), or Duplicate.
+    def installed: (Ticket ticket, Integer replica, Integer checkpoint, nanoseconds now)
+                   -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :mismatch)
+    # Recorded(:activate), or Duplicate.
+    def fenced: (Ticket ticket, Integer token, nanoseconds now)
+                -> (acked | ticket_refusal | :out_of_phase | :stale_token | :mismatch)
+    # Recorded(:complete); never Duplicate, a repeat is :stale.
+    def activated: (Ticket ticket, Integer replica, Integer token, nanoseconds now)
+                   -> (Recorded | ticket_refusal | :out_of_phase | :wrong_replica | :mismatch)
+    # Recorded(:rollback), or Duplicate. `token` is nil for an unfenced abort.
+    def abort: (Ticket ticket, Integer? token, nanoseconds now)
+               -> (acked | ticket_refusal | :stale_token | :fence_required | :mismatch)
+    # Recorded(:rollback | :aborted), or Duplicate.
+    def resumed: (Ticket ticket, Integer replica, nanoseconds now)
+                 -> (acked | ticket_refusal | :out_of_phase | :wrong_replica)
+    # Recorded(:rollback | :aborted), or Duplicate.
+    def discarded: (Ticket ticket, Integer replica, nanoseconds now)
+                   -> (acked | ticket_refusal | :out_of_phase | :wrong_replica)
     def status: (Integer partition) -> Status?
-    def orders: (?Integer from, ?limit: Integer) -> [Array[Order], Integer]
-    def outstanding: (Ticket, ?Integer from, ?limit: Integer) -> (Array[Integer] | refusal)
-    def overdue: (Integer now_ns, ?Integer from, ?limit: Integer) -> [Array[Ticket], Integer]
+    def orders: (Integer from, Integer limit) -> [Array[Order], Integer]
+    def outstanding: (Ticket ticket, Integer from, Integer limit)
+                     -> (Array[Integer] | :stale | :unknown | :out_of_phase)
+    def overdue: (nanoseconds now, Integer from, Integer limit) -> [Array[Ticket], Integer]
     def active: () -> Integer
     def generation: () -> Integer
 
     private
 
+    ACTIONS: Hash[Symbol, singleton(Data)]
+    def self.native_restored: (Integer, Integer, Integer) -> Handoff
+    def native_limits: () -> [Integer, Integer]
     def key: (Ticket) -> [Integer, Integer]
+    def acked: (Symbol | [bool, phase]) -> (acked | Symbol)
+    def order: (Integer, Integer, Integer | :authority, Symbol, Integer?) -> Order
     def native_start: (Integer, [Integer, Integer], Integer, Integer, Integer) -> ([Integer, Integer] | refusal)
-    def native_quiesced: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_drained: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_committed: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_captured: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_installed: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_fenced: (Integer, Integer, Integer, Integer) -> Symbol
-    def native_activated: (Integer, Integer, Integer, Integer, Integer) -> Symbol
-    def native_abort: (Integer, Integer, Integer?, Integer) -> Symbol
-    def native_resumed: (Integer, Integer, Integer, Integer) -> Symbol
-    def native_discarded: (Integer, Integer, Integer, Integer) -> Symbol
+    def native_quiesced: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_drained: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_committed: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_captured: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_installed: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_fenced: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_activated: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_abort: (Integer, Integer, Integer?, Integer) -> (Symbol | [bool, phase])
+    def native_resumed: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def native_discarded: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
     def native_status: (Integer) -> [Array[untyped], Array[untyped]]?
     def native_orders: (Integer, Integer) -> [Array[Array[untyped]], Integer]
     def native_outstanding: (Integer, Integer, Integer, Integer) -> (Array[Integer] | refusal)

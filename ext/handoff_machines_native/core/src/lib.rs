@@ -2,6 +2,7 @@
 #![doc = include_str!("../README.md")]
 
 mod iter;
+mod refusal;
 mod transfer;
 mod types;
 
@@ -9,8 +10,9 @@ use core::time::Duration;
 
 pub use iter::{Orders, Outstanding, Overdue};
 pub use lease_machines::FencingToken;
+pub use refusal::Refusal;
 use transfer::{Next, Transfer};
-pub use types::{Action, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
+pub use types::{Acked, Action, Limits, Order, Phase, Recipient, Status, Ticket};
 
 /// Coordinator for at most `N` concurrent partition transfers, each with a
 /// drain window of `WORDS * 64` offsets.
@@ -117,77 +119,98 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// admitted offset. Moves to `Drain`, or straight to `Checkpoint` when
     /// nothing is in flight.
     ///
+    /// Repeated with the recorded `until`, for as long as the transfer lives,
+    /// it is an idempotent repeat: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica` or `BehindBase`.
+    /// A ticket refusal, `OutOfPhase` (the transfer was given up before the
+    /// source quiesced), `WrongReplica`, `BehindBase`, or `Mismatch` when a
+    /// different quiesce point is already recorded.
     pub fn quiesced(
         &mut self,
         ticket: Ticket,
         replica: u64,
         until: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.quiesced(replica, until))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.quiesced(replica, until))
     }
 
     /// The source finished one in-flight `offset`. Moves to `Checkpoint` once
     /// every offset below the quiesce point is acknowledged.
     ///
+    /// An offset already acknowledged or already committed is an idempotent
+    /// repeat, during the drain and after it: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica`, `BeyondDrain`,
-    /// `Duplicate` or `OutOfWindow`.
+    /// A ticket refusal, `OutOfPhase` (before the quiesce point is known, or
+    /// an unacknowledged offset once the drain was given up), `WrongReplica`,
+    /// `BeyondDrain` or `OutOfWindow`.
     pub fn drained(
         &mut self,
         ticket: Ticket,
         replica: u64,
         offset: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.drained(replica, offset))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.drained(replica, offset))
     }
 
     /// The source durably committed every offset below `offset`; the drain
     /// window slides there. Needed only when the drain is wider than `WINDOW`.
     ///
+    /// An offset not beyond the window base is already committed, an
+    /// idempotent repeat during the drain and after it: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica`, `Duplicate` or `Unacked`.
+    /// A ticket refusal, `OutOfPhase` (before the quiesce point is known, or
+    /// a new offset once the drain is over), `WrongReplica` or `Unacked`.
     pub fn committed(
         &mut self,
         ticket: Ticket,
         replica: u64,
         offset: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.committed(replica, offset))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.committed(replica, offset))
     }
 
     /// The source captured `checkpoint` at the quiesce point.
     ///
+    /// Repeated with the recorded checkpoint it is an idempotent repeat:
+    /// [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase` or `WrongReplica`.
+    /// A ticket refusal, `OutOfPhase` (the drain is not over), `WrongReplica`,
+    /// or `Mismatch` when a different checkpoint is already recorded.
     pub fn captured(
         &mut self,
         ticket: Ticket,
         replica: u64,
         checkpoint: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| {
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| {
             transfer.captured(replica, checkpoint)
         })
     }
 
     /// The target installed `checkpoint`. Moves to `Activate`.
     ///
+    /// Repeated once recorded it is an idempotent repeat: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica` or `Mismatch`.
+    /// A ticket refusal, `OutOfPhase` (no checkpoint was captured, or the
+    /// transfer was given up before the install), `WrongReplica`, or
+    /// `Mismatch` when `checkpoint` is not the captured one.
     pub fn installed(
         &mut self,
         ticket: Ticket,
         replica: u64,
         checkpoint: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| {
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| {
             transfer.installed(replica, checkpoint)
         })
     }
@@ -195,29 +218,38 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// The authority issued the target `token`, which must exceed the
     /// source's token. From here on, aborting needs a newer token still.
     ///
+    /// Repeated with the recorded token it is an idempotent repeat:
+    /// [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase` or `StaleToken`.
+    /// A ticket refusal, `OutOfPhase` (no token is awaited yet, or the
+    /// transfer was given up before one arrived), `StaleToken`, or `Mismatch`
+    /// when a different token is already recorded.
     pub fn fenced(
         &mut self,
         ticket: Ticket,
         token: FencingToken,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.fenced(token))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.fenced(token))
     }
 
     /// The target is serving under `token`. Ends the transfer as `Complete`.
     ///
+    /// It frees the slot, so a repeat cannot be told from any other finished
+    /// ticket and is refused as `Stale`; this call never answers a duplicate.
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica` or `Mismatch`.
+    /// A ticket refusal, `OutOfPhase` (activation is not ordered, or the
+    /// transfer was given up), `WrongReplica` or `Mismatch`.
     pub fn activated(
         &mut self,
         ticket: Ticket,
         replica: u64,
         token: FencingToken,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.activated(replica, token))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.activated(replica, token))
     }
 
     /// Give the transfer up from any phase and move to `Rollback`.
@@ -226,43 +258,56 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// knows, and the source resumes under it. It is required once activation
     /// was ordered, because the target may already be serving.
     ///
+    /// During the rollback, repeated with the same `token` (or the same
+    /// absence of one), it is an idempotent repeat: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `StaleToken` or `FenceRequired`.
+    /// A ticket refusal, `StaleToken`, `FenceRequired`, or `Mismatch` when the
+    /// rollback is already under way with a different token.
     pub fn abort(
         &mut self,
         ticket: Ticket,
         token: Option<FencingToken>,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.abort(token))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.abort(token))
     }
 
     /// The source is serving again. Ends the rollback as `Aborted` once no
     /// other rollback acknowledgement is owed.
     ///
+    /// While the rollback still waits for the target, a second `resumed` is
+    /// an idempotent repeat: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica` or `Duplicate`.
+    /// A ticket refusal, `OutOfPhase` (no rollback was ordered) or
+    /// `WrongReplica`.
     pub fn resumed(
         &mut self,
         ticket: Ticket,
         replica: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.resumed(replica))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.resumed(replica))
     }
 
     /// The target dropped what it installed. Ends the rollback as `Aborted`
     /// once no other rollback acknowledgement is owed.
     ///
+    /// A `discarded` the rollback does not wait for (already recorded, or
+    /// never owed because the target was never asked to install) is an
+    /// idempotent repeat: [`Acked::Duplicate`].
+    ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase`, `WrongReplica` or `Duplicate`.
+    /// A ticket refusal, `OutOfPhase` (no rollback was ordered) or
+    /// `WrongReplica`.
     pub fn discarded(
         &mut self,
         ticket: Ticket,
         replica: u64,
         now: Duration,
-    ) -> Result<Phase, Refusal> {
-        self.apply(ticket, now, |transfer| transfer.discarded(replica))
+    ) -> Result<Acked, Refusal> {
+        self.acked(ticket, now, |transfer| transfer.discarded(replica))
     }
 
     /// The transfer currently moving `partition`, if any.
@@ -345,18 +390,20 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         )
     }
 
-    fn apply(
+    /// A repeat answers before `observed` moves: it changes nothing at all.
+    fn acked(
         &mut self,
         ticket: Ticket,
         now: Duration,
         ack: impl FnOnce(&mut Transfer<WORDS>) -> Result<Next, Refusal>,
-    ) -> Result<Phase, Refusal> {
+    ) -> Result<Acked, Refusal> {
         self.clock(now)?;
         let index = self.locate(ticket)?;
         let deadline = self.deadline(now);
         let slot = self.slots.get_mut(index).ok_or(Refusal::Unknown)?;
         let transfer = slot.as_mut().ok_or(Refusal::Unknown)?;
         let phase = match ack(transfer)? {
+            Next::Repeat => return Ok(Acked::Duplicate(transfer.phase())),
             Next::Same => transfer.phase(),
             Next::Moved => {
                 transfer.deadline = deadline;
@@ -368,7 +415,7 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
             }
         };
         self.observed = now;
-        Ok(phase)
+        Ok(Acked::Recorded(phase))
     }
 }
 

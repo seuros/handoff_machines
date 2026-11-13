@@ -36,11 +36,35 @@ issue fencing tokens, send messages or persist anything.
 - Every mutating call takes `now`. An earlier `now` than the last accepted one is
   `ClockRegressed`. Each phase gets `Limits::phase_budget`; `overdue` lists
   transfers past it. That is advice: the coordinator never aborts by itself.
-- A refused call changes nothing.
+- Every call that can refuse returns `Result<T, Refusal>`. `Refusal` is the one
+  enum for "not honoured", and a refused call changes nothing. No public enum
+  is `#[non_exhaustive]`: a new variant is a breaking change every caller
+  matches on.
+- A network may deliver any acknowledgement twice, so every acknowledgement
+  method (`quiesced`, `drained`, `committed`, `captured`, `installed`, `fenced`,
+  `activated`, `abort`, `resumed`, `discarded`) returns `Result<Acked, Refusal>`:
+  `Acked::Recorded(phase)` the first time, `Acked::Duplicate(phase)` for an
+  idempotent repeat. A repeat is honoured, not refused, and changes nothing,
+  not even the observed clock.
+- A repeat is answered from what the transfer recorded, for as long as the
+  transfer lives, rollback included: `quiesced` with the recorded quiesce
+  point, `drained` of an acknowledged or committed offset, `committed` at or
+  below the window base, `captured` and `installed` with the recorded
+  checkpoint, `fenced` with the recorded token, `abort` during the rollback
+  with the same token (or the same absence of one), and a `resumed` or
+  `discarded` already recorded or never owed.
+- A replay whose payload differs from the record is not a repeat: a different
+  quiesce point, checkpoint, activation token or rollback token is `Mismatch`.
+  From the wrong replica it is `WrongReplica`.
+- `OutOfPhase` is what is left: the transfer is not waiting for the
+  acknowledgement and never recorded it, because it came too early or because
+  the transfer was given up first. `activated` and the acknowledgement that
+  ends a rollback free the slot, so their repeats are `Stale` like any other
+  finished ticket's.
 
 ```rust
 use core::time::Duration;
-use handoff_machines::{Action, FencingToken, Handoff, Limits, Phase, Recipient};
+use handoff_machines::{Acked, Action, FencingToken, Handoff, Limits, Phase, Recipient};
 
 # fn example() -> Option<()> {
 let limits = Limits { phase_budget: Duration::from_secs(30), per_replica: 2 };
@@ -52,15 +76,18 @@ let ticket = handoff.start(42, 1, 2, 100, held, now).ok()?;
 let order = handoff.orders(0).next()?;
 assert_eq!((order.to, order.action), (Recipient::Replica(1), Action::Quiesce));
 
-assert_eq!(handoff.quiesced(ticket, 1, 102, now), Ok(Phase::Drain));
-assert_eq!(handoff.drained(ticket, 1, 101, now), Ok(Phase::Drain));
+let acked = |phase| Ok(Acked::Recorded(phase));
+assert_eq!(handoff.quiesced(ticket, 1, 102, now), acked(Phase::Drain));
+assert_eq!(handoff.quiesced(ticket, 1, 102, now), Ok(Acked::Duplicate(Phase::Drain)));
+assert_eq!(handoff.drained(ticket, 1, 101, now), acked(Phase::Drain));
+assert_eq!(handoff.drained(ticket, 1, 101, now), Ok(Acked::Duplicate(Phase::Drain)));
 assert_eq!(handoff.outstanding(ticket, 0).ok()?.next(), Some(100));
-assert_eq!(handoff.drained(ticket, 1, 100, now), Ok(Phase::Checkpoint));
-assert_eq!(handoff.captured(ticket, 1, 9, now), Ok(Phase::Checkpoint));
-assert_eq!(handoff.installed(ticket, 2, 9, now), Ok(Phase::Activate));
+assert_eq!(handoff.drained(ticket, 1, 100, now), acked(Phase::Checkpoint));
+assert_eq!(handoff.captured(ticket, 1, 9, now), acked(Phase::Checkpoint));
+assert_eq!(handoff.installed(ticket, 2, 9, now), acked(Phase::Activate));
 let granted = FencingToken::new(8)?; // from your lease authority
-assert_eq!(handoff.fenced(ticket, granted, now), Ok(Phase::Activate));
-assert_eq!(handoff.activated(ticket, 2, granted, now), Ok(Phase::Complete));
+assert_eq!(handoff.fenced(ticket, granted, now), acked(Phase::Activate));
+assert_eq!(handoff.activated(ticket, 2, granted, now), acked(Phase::Complete));
 assert_eq!(handoff.active(), 0);
 # Some(())
 # }
