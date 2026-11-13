@@ -3,6 +3,8 @@ use std::{collections::BTreeSet, vec::Vec};
 
 use crate::{Acked, Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
 
+use periscope_machines::sequence_of;
+
 use super::token;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +65,8 @@ impl Move {
 
 pub struct Model {
     pub moves: Vec<Move>,
+    pub scope: u16,
+    /// Sequence number of the last generation issued.
     pub issued: u64,
     pub seen: Duration,
     pub limits: Limits,
@@ -106,7 +110,7 @@ impl Model {
             Some(Refusal::Full)
         } else if busy(s) || busy(t) {
             Some(Refusal::ReplicaBusy)
-        } else if self.issued == u64::MAX {
+        } else if self.issued == periscope_machines::SEQUENCE_MAX {
             Some(Refusal::Exhausted)
         } else {
             None
@@ -118,7 +122,7 @@ impl Model {
         self.seen = now;
         let ticket = Ticket {
             partition: p,
-            generation: self.issued,
+            generation: periscope_machines::scoped(self.scope, self.issued),
         };
         self.moves.push(Move {
             ticket,
@@ -143,7 +147,10 @@ impl Model {
     pub fn lookup(&self, ticket: Ticket) -> Result<usize, Refusal> {
         match self.moves.iter().position(|m| m.ticket == ticket) {
             Some(index) => Ok(index),
-            None if (1..=self.issued).contains(&ticket.generation) => Err(Refusal::Stale),
+            None if ticket.scope() != self.scope => Err(Refusal::Unknown),
+            None if (1..=self.issued).contains(&sequence_of(ticket.generation)) => {
+                Err(Refusal::Stale)
+            }
             None => Err(Refusal::Unknown),
         }
     }

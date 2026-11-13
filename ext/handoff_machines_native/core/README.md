@@ -17,6 +17,34 @@ issue fencing tokens, send messages or persist anything.
   increasing and never reused. Every acknowledgement carries its ticket: an
   issued generation that is no longer the partition's transfer is `Stale`, one
   never issued is `Unknown`.
+- **Scopes.** A ticket means something only to the coordinator that issued
+  it. A generation is a `u64` in the
+  [`periscope-machines`](https://crates.io/crates/periscope-machines) layout:
+  the coordinator's scope in the top 16 bits, a sequence counted from 1 in
+  the low 48. Two coordinators count the same sequence, so without scopes a
+  ticket for the same partition given to the wrong one is acknowledged there.
+  `Handoff::new(limits)` is scope zero and issues 1, 2, 3;
+  `Handoff::with_scope(limits, scope)` issues the same sequence under `scope`;
+  `Handoff::scope()` and `Ticket::scope()` read it back. A ticket of another
+  scope was never issued here: every acknowledgement and `outstanding` answer
+  `Unknown` before any transfer is looked up, and nothing changes. The
+  coordinator reads no clock and no random source, so it cannot pick a scope;
+  two coordinators left in the same scope still alias. A scope holds 2^48 - 1
+  generations, then `start` answers `Exhausted`.
+- **Restarts.** A fresh coordinator counts from 1 again, so a ticket that
+  outlived a restart could name a new transfer. Either resume the sequence,
+  or give each incarnation a scope no earlier one used.
+  `Handoff::restored(limits, scope, last_generation)` resumes: it takes the
+  scope and what `generation()` answered, and is `None` when that value is
+  not of `scope`. The scope is never read out of the saved value, so one
+  that lost its top bits, or the `0` a store answers for a missing row,
+  cannot land a coordinator in scope zero. "Nothing issued yet" is spelled
+  one way, `scope` above a zero sequence, which is what `generation()`
+  answers then; with no saved value, call `with_scope`.
+- An idempotent repeat (`Acked::Duplicate`) is answered only from a live
+  transfer whose ticket matches, scope included. A ticket whose transfer
+  ended is `Stale` even though the coordinator can tell it issued it: it does
+  not keep how the transfer ended.
 - Each phase advances only on an explicit acknowledgement from the replica that
   holds the role: `quiesced` (source, with the quiesce point), `drained` (source,
   one in-flight offset at a time), `captured` (source, checkpoint identity),
@@ -106,7 +134,8 @@ assert_eq!(handoff.active(), 0);
    fencing, a source that missed `Quiesce` keeps writing.
 3. **Transfer replay protection.** Generations refuse stale acknowledgements
    inside one coordinator lifetime. Across restarts, persist `generation()` before
-   exposing a ticket and rebuild with `Handoff::restored`. In-flight transfers
+   exposing a ticket and rebuild with `Handoff::restored`, or build every
+   incarnation with a scope of its own. In-flight transfers
    are not restored: start them again under a new generation, and let the
    authority's highest token say who owns a partition that was mid-activation.
 4. **Delivery and timing.** Orders are restated until acknowledged; delivery,

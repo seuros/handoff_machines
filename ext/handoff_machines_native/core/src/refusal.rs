@@ -13,13 +13,15 @@ pub enum Refusal {
     ReplicaBusy,
     /// Source and target are the same replica.
     SameReplica,
-    /// The generation space is exhausted; generations never wrap.
+    /// The scope's generation space (2^48 - 1) is exhausted; generations
+    /// never wrap.
     Exhausted,
     /// `now` is earlier than the latest accepted observation.
     ClockRegressed,
     /// The ticket's generation was issued but is not the partition's current transfer.
     Stale,
-    /// The ticket was never issued by this coordinator.
+    /// The ticket was never issued by this coordinator: its generation is
+    /// zero, beyond the last one issued, or of another scope.
     Unknown,
     /// The transfer is not waiting for this acknowledgement and never
     /// recorded it: it came too early, or the transfer left the path that

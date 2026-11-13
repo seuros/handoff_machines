@@ -1,17 +1,30 @@
 use core::time::Duration;
 
 use lease_machines::FencingToken;
+use periscope_machines::scope_of;
 
 /// Identity of one transfer: the partition and the generation it was issued under.
 ///
 /// Every acknowledgement carries the ticket. A ticket whose generation is not
-/// the partition's current transfer generation is refused.
+/// the partition's current transfer generation is refused, and so is one
+/// whose generation another coordinator's scope issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ticket {
     /// Caller-owned partition identity.
     pub partition: u64,
-    /// Coordinator-issued transfer generation; never zero, never reused.
+    /// Coordinator-issued transfer generation; never zero, never reused. It
+    /// carries the coordinator's scope above a sequence counted from one, so
+    /// scope zero issues 1, 2, 3.
     pub generation: u64,
+}
+
+impl Ticket {
+    /// The scope of the coordinator that issued this ticket, see
+    /// [`Handoff::with_scope`](crate::Handoff::with_scope).
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        scope_of(self.generation)
+    }
 }
 
 /// Where a transfer stands. `Complete` and `Aborted` are only ever returned

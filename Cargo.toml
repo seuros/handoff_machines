@@ -14,6 +14,7 @@ magnus = { version = "0.9.3", default-features = false }
 rb-sys = { version = "0.9.130", default-features = false, features = ["stable-api-compiled-fallback"] }
 lease-machines = ">=0.3"
 offset-machines = ">=0.3"
+periscope-machines = ">=0.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -4,6 +4,7 @@ use std::{collections::BTreeSet, format, string::String, vec::Vec};
 use super::model::{Model, Wait};
 use super::{LIMITS, token};
 use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Ticket};
+use periscope_machines::{scoped, sequence_of};
 
 const N: usize = 4;
 const WORDS: usize = 1;
@@ -57,11 +58,12 @@ struct Run {
 }
 
 impl Run {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, scope: u16) -> Self {
         Self {
-            core: Handoff::new(LIMITS),
+            core: Handoff::with_scope(LIMITS, scope),
             model: Model {
                 moves: Vec::new(),
+                scope,
                 issued: 0,
                 seen: Duration::ZERO,
                 limits: LIMITS,
@@ -87,12 +89,25 @@ impl Run {
         self.now
     }
 
+    /// A ticket to acknowledge. One in twelve is the same partition and
+    /// sequence number as another scope would have issued it.
     fn ticket(&mut self) -> Ticket {
+        let ticket = self.own_ticket();
+        if !self.draws.chance(8) {
+            return ticket;
+        }
+        Ticket {
+            generation: ticket.generation ^ scoped(1 + (self.model.scope & 1), 0),
+            ..ticket
+        }
+    }
+
+    fn own_ticket(&mut self) -> Ticket {
         let roll = self.draws.below(100);
         if roll < 6 || self.tickets.is_empty() {
             return Ticket {
                 partition: self.draws.below(6),
-                generation: self.draws.below(self.model.issued + 3),
+                generation: scoped(self.model.scope, self.draws.below(self.model.issued + 3)),
             };
         }
         if roll < 14 || self.model.moves.is_empty() {
@@ -125,6 +140,19 @@ impl Run {
         } else {
             let ticket = self.ticket();
             let got = self.ack(ticket, now);
+            if ticket.scope() != self.model.scope {
+                let live = self.model.moves.iter();
+                let aimed = live
+                    .filter(|m| m.ticket.partition == ticket.partition)
+                    .any(|m| sequence_of(m.ticket.generation) == sequence_of(ticket.generation));
+                let refused = [Err(Refusal::Unknown), Err(Refusal::ClockRegressed)];
+                assert!(refused.contains(&got), "a foreign ticket got {got:?}");
+                self.seen.insert(String::from(if aimed {
+                    "foreign ticket at a live transfer"
+                } else {
+                    "foreign ticket"
+                }));
+            }
             self.record(got, &before);
         }
         self.compare();
@@ -282,7 +310,9 @@ impl Run {
 
     fn compare(&self) {
         assert_eq!(self.core.active(), self.model.moves.len());
-        assert_eq!(self.core.generation(), self.model.issued);
+        let issued = scoped(self.model.scope, self.model.issued);
+        assert_eq!(self.core.generation(), issued);
+        assert_eq!(self.core.scope(), self.model.scope);
         for partition in 0..6 {
             assert_eq!(self.core.status(partition), self.model.status(partition));
         }
@@ -310,7 +340,9 @@ impl Run {
 fn core_matches_the_naive_model_under_random_operations() {
     let mut seen = BTreeSet::new();
     for seed in 1..=40_u64 {
-        let mut run = Run::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        // Scope zero, a middle scope and the last one all behave alike.
+        let scope = [0, 0x0102, u16::MAX][usize::try_from(seed % 3).unwrap()];
+        let mut run = Run::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), scope);
         for _ in 0..4_000 {
             run.step();
         }
@@ -353,6 +385,8 @@ fn core_matches_the_naive_model_under_random_operations() {
         "Err(Mismatch)",
         "Err(StaleToken)",
         "Err(FenceRequired)",
+        "foreign ticket",
+        "foreign ticket at a live transfer",
     ];
     assert!(!seen.contains("repeat of activated"), "it frees the slot");
     for outcome in expected {

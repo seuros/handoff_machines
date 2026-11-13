@@ -10,6 +10,7 @@ use core::time::Duration;
 
 pub use iter::{Orders, Outstanding, Overdue};
 pub use lease_machines::FencingToken;
+use periscope_machines::{Issuer, scope_of, scoped, sequence_of};
 pub use refusal::Refusal;
 use transfer::{Next, Transfer};
 pub use types::{Acked, Action, Limits, Order, Phase, Recipient, Status, Ticket};
@@ -23,7 +24,8 @@ pub use types::{Acked, Action, Limits, Order, Phase, Recipient, Status, Ticket};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handoff<const N: usize, const WORDS: usize> {
     slots: [Option<Transfer<WORDS>>; N],
-    generation: u64,
+    /// Issues the ticket generations; it also holds the coordinator's scope.
+    generations: Issuer,
     observed: Duration,
     limits: Limits,
 }
@@ -34,28 +36,77 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// Offsets one transfer's drain window covers before it must slide.
     pub const WINDOW: u64 = WORDS as u64 * 64;
 
-    /// Start with no transfers in a fresh generation namespace.
+    /// Start with no transfers in a fresh generation namespace, in scope zero.
     #[must_use]
     pub const fn new(limits: Limits) -> Self {
-        Self::restored(limits, 0)
+        Self::with_scope(limits, 0)
     }
 
-    /// Start with no transfers, issuing generations above `last_generation`:
-    /// the highest generation a previous coordinator of this namespace issued.
+    /// Start with no transfers in a fresh generation namespace whose
+    /// generations carry `scope`.
+    ///
+    /// A generation is a plain integer counted from one, so two coordinators
+    /// in the same scope issue the same tickets for the same partition, and
+    /// an acknowledgement sent to the wrong one is recorded there. Give every
+    /// coordinator whose tickets could meet its own scope: a ticket of
+    /// another scope is then always [`Refusal::Unknown`]. The coordinator
+    /// cannot pick a scope itself; keeping them distinct is the caller's job.
     #[must_use]
-    pub const fn restored(limits: Limits, last_generation: u64) -> Self {
+    pub const fn with_scope(limits: Limits, scope: u16) -> Self {
+        Self::resuming(limits, Issuer::new(scope))
+    }
+
+    /// Start with no transfers in `scope`, issuing generations above
+    /// `last_generation`: what [`Handoff::generation`] answered on the
+    /// previous coordinator of this namespace.
+    ///
+    /// The scope is the caller's, never read out of the saved value, and the
+    /// saved value must carry it: `None` when `last_generation` is of another
+    /// scope. So a value that lost its top bits, or the `0` a store answers
+    /// for a row that is not there, cannot put a coordinator of a non-zero
+    /// scope into scope zero. The one value that means "nothing issued yet"
+    /// is `scope` above a zero sequence, which is what `generation()` answers
+    /// then; it is `0` only in scope zero. With no saved value at all, call
+    /// [`Handoff::with_scope`].
+    #[must_use]
+    pub const fn restored(limits: Limits, scope: u16, last_generation: u64) -> Option<Self> {
+        if scope_of(last_generation) != scope {
+            return None;
+        }
+        match Issuer::resumed(scope, sequence_of(last_generation)) {
+            Some(generations) => Some(Self::resuming(limits, generations)),
+            // Unreachable: a sequence taken out of an id is never past the last.
+            None => None,
+        }
+    }
+
+    const fn resuming(limits: Limits, generations: Issuer) -> Self {
         Self {
             slots: [const { None }; N],
-            generation: last_generation,
+            generations,
             observed: Duration::ZERO,
             limits,
         }
     }
 
+    /// The scope carried by every generation this coordinator issues.
+    #[must_use]
+    pub const fn scope(&self) -> u16 {
+        self.generations.scope()
+    }
+
     /// Highest generation issued so far; persist it before exposing a ticket.
+    ///
+    /// Before the first, it is the scope alone above a zero sequence:
+    /// `scope << 48`, which is zero only in scope zero. That value is not a
+    /// generation (no ticket carries it, and a ticket made from it is
+    /// [`Refusal::Unknown`]), so read "nothing issued yet" from its sequence,
+    /// not by comparing it with zero. Persist the whole `u64` beside
+    /// [`Handoff::scope`]: [`Handoff::restored`] takes both and refuses a
+    /// value that is not of that scope.
     #[must_use]
     pub const fn generation(&self) -> u64 {
-        self.generation
+        scoped(self.generations.scope(), self.generations.issued())
     }
 
     /// Number of transfers in progress.
@@ -100,7 +151,10 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         {
             return Err(Refusal::ReplicaBusy);
         }
-        let generation = self.generation.checked_add(1).ok_or(Refusal::Exhausted)?;
+        let generation = match self.generations.peek() {
+            Ok(generation) => generation,
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        };
         let ticket = Ticket {
             partition,
             generation,
@@ -109,8 +163,10 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         let transfer = Transfer::new(ticket, source, target, base, source_token, deadline)
             .ok_or(Refusal::Exhausted)?;
         let slot = self.slots.get_mut(free).ok_or(Refusal::Full)?;
-        *slot = Some(transfer);
-        self.generation = generation;
+        match self.generations.issue() {
+            Ok(_) => *slot = Some(transfer),
+            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
+        }
         self.observed = now;
         Ok(ticket)
     }
@@ -376,18 +432,18 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         busy.filter(|transfer| transfer.involves(replica)).count()
     }
 
+    /// A generation this coordinator did not issue (another scope, or a
+    /// sequence it has not reached) is unknown: no slot is read. One it did
+    /// issue and holds in no slot is stale.
     fn locate(&self, ticket: Ticket) -> Result<usize, Refusal> {
+        if !self.generations.owns(ticket.generation) {
+            return Err(Refusal::Unknown);
+        }
         let index = self.slots.iter().position(|slot| {
             slot.as_ref()
                 .is_some_and(|transfer| transfer.ticket == ticket)
         });
-        index.ok_or(
-            if ticket.generation == 0 || ticket.generation > self.generation {
-                Refusal::Unknown
-            } else {
-                Refusal::Stale
-            },
-        )
+        index.ok_or(Refusal::Stale)
     }
 
     /// A repeat answers before `observed` moves: it changes nothing at all.

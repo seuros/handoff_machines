@@ -18,6 +18,8 @@ module HandoffMachines
                | :stale | :unknown | :out_of_phase | :wrong_replica | :behind_base | :beyond_drain
                | :out_of_window | :unacked | :mismatch | :stale_token | :fence_required
   # Refusals every acknowledgement can answer for its ticket and clock.
+  # :unknown is a ticket this coordinator never issued, which includes every
+  # ticket of another scope; :stale is one it issued that is no longer live.
   type ticket_refusal = :clock_regressed | :stale | :unknown
   # Honoured acknowledgement, the core's `Acked`. Recorded: the transfer now
   # stands at `phase`. Duplicate: an idempotent repeat of an acknowledgement
@@ -40,9 +42,13 @@ module HandoffMachines
 
   class Ticket < Data
     attr_reader partition: Integer
+    # Never zero, never reused: the issuing coordinator's scope in the top
+    # 16 bits above a sequence counted from 1.
     attr_reader generation: Integer
     def self.new: (Integer partition, Integer generation) -> Ticket
                 | (partition: Integer, generation: Integer) -> Ticket
+    # The scope of the coordinator that issued this ticket.
+    def scope: () -> Integer
   end
 
   class Recorded < Data
@@ -131,8 +137,17 @@ module HandoffMachines
   # The core's `Handoff<16, 4>`. Honoured answers come first in every return
   # type, then the refusals that method can answer.
   class Handoff
+    # A fresh generation namespace in scope zero.
     def self.new: (Limits limits) -> Handoff
-    def self.restored: (Limits limits, Integer last_generation) -> Handoff
+    # A fresh generation namespace whose generations carry `scope`, an Integer
+    # in 0..65_535 (TypeError for a non-Integer, RangeError outside the range).
+    def self.with_scope: (Limits limits, Integer scope) -> Handoff
+    # Generations of `scope` above `last_generation`, what #generation answered
+    # before the restart. RangeError when `last_generation` is not of `scope`:
+    # a value from another scope, one that lost its top bits, or a bare 0 for
+    # a non-zero scope. With nothing saved, call with_scope.
+    def self.restored: (Limits limits, Integer scope, Integer last_generation) -> Handoff
+    def scope: () -> Integer
     def limits: () -> Limits
     def start: (Integer partition, Integer source, Integer target, Integer base, Integer source_token,
                 nanoseconds now)
@@ -178,7 +193,10 @@ module HandoffMachines
     private
 
     ACTIONS: Hash[Symbol, singleton(Data)]
-    def self.native_restored: (Integer, Integer, Integer) -> Handoff
+    def self.fields: (Limits) -> [Integer, Integer]
+    def self.native_with_scope: (Integer, Integer, Integer) -> Handoff
+    def self.native_restored: (Integer, Integer, [Integer, Integer]) -> Handoff
+    def self.native_scope_of: (Integer) -> Integer
     def native_limits: () -> [Integer, Integer]
     def key: (Ticket) -> [Integer, Integer]
     def acked: (Symbol | [bool, phase]) -> (acked | Symbol)

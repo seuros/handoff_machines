@@ -1,5 +1,5 @@
 //! Private native entry point.
-use crate::{CAPACITY, Core, Handoff, names};
+use crate::{CAPACITY, Core, Handoff, names, scope_of};
 use magnus::{Error, Ruby, function, method, prelude::*};
 
 #[magnus::init]
@@ -16,7 +16,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.const_set("REFUSALS", symbols(&names::REFUSALS))?;
     let class = module.define_class("Handoff", ruby.class_object())?;
     class.undef_default_alloc_func();
+    class.define_singleton_method("native_with_scope", function!(Handoff::with_scope, 3))?;
     class.define_singleton_method("native_restored", function!(Handoff::restored, 3))?;
+    class.define_singleton_method("native_scope_of", function!(scope_of, 1))?;
+    class.define_method("scope", method!(Handoff::scope, 0))?;
     class.define_private_method("native_limits", method!(Handoff::limits, 0))?;
     class.define_private_method("native_start", method!(Handoff::start, 5))?;
     class.define_private_method("native_quiesced", method!(Handoff::quiesced, 5))?;

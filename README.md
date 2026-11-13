@@ -255,7 +255,7 @@ handoff.quiesced(old_ticket, 1, 102, 9)                         # => :stale
 handoff.quiesced(HandoffMachines::Ticket.new(42, 999), 1, 0, 9) # => :unknown
 ```
 
-A ticket whose transfer has finished, aborted or been replaced is `:stale`. A generation this coordinator never issued is `:unknown`. Neither changes anything.
+A ticket whose transfer has finished, aborted or been replaced is `:stale`. A generation this coordinator never issued is `:unknown`, and that includes every ticket from a coordinator of another scope. Neither changes anything.
 
 ### Capacity
 
@@ -312,7 +312,7 @@ Every acknowledgement can also refuse with `:clock_regressed`, `:stale` or `:unk
 
 A `Duplicate` carries the phase the transfer stands at now: any phase from the one the acknowledgement first led to up to `:rollback`.
 
-`Handoff.new(limits)`, `Handoff.restored(limits, last_generation)`, `limits`, `status`, `orders`, `overdue`, `active` and `generation` never refuse.
+`Handoff.new(limits)`, `Handoff.with_scope(limits, scope)`, `limits`, `scope`, `status`, `orders`, `overdue`, `active` and `generation` never refuse. `Handoff.restored(limits, scope, last_generation)` answers a coordinator or raises `RangeError` when `last_generation` is not a generation of `scope`.
 
 ## The Rules of the Tender
 
@@ -320,6 +320,7 @@ A `Duplicate` carries the phase the transfer stands at now: any phase from the o
 - **Time is Integer nanoseconds.** `now`, `Limits#phase_budget` and `Status#deadline` are nanoseconds on one monotonic clock. A Float or any other non-Integer raises `TypeError`; a negative value or one past `2**64-1` raises `RangeError`. `deadline` is `now + phase_budget` exactly, so it can read back larger than `2**64-1`.
 - **Values mirror the core.** `Limits`, `Ticket`, `Order` and `Status` have the core struct's fields in the core's order. An enum variant with a field is a `Data` named after it (`Recorded`, `Duplicate`, `Replica`, `Drain`, `Capture`, `Install`, `Fence`, `Activate`, `Resume`); one without is a Symbol (`:authority`, `:quiesce`, `:discard`, every phase). No argument has a default the core lacks: `orders`, `outstanding` and `overdue` take `from` and `limit` every time, and `limit` is the one argument the core does not have, because Ruby gets an Array where the core hands out an iterator.
 - **Tickets are plain data.** A `Ticket` is a `Data` with a partition and a generation, so it survives a trip over the wire. Anything that isn't a `Ticket` raises `TypeError`, and so does a constructor given anything but a `Limits`.
+- **Scopes.** A ticket is only meaningful to the coordinator that issued it. Generations count from 1, so two coordinators hand out the same tickets for the same partition, and a reply sent to the wrong one would be recorded there. Give each coordinator its own scope: `Handoff.with_scope(limits, scope)`, any Integer in `0..65_535` (a non-Integer raises `TypeError`, anything outside the range raises `RangeError`). `Handoff.new(limits)` is scope zero. The scope rides in the top 16 bits of every generation; `handoff.scope` and `ticket.scope` read it back. A ticket from another scope is `:unknown` to every acknowledgement and to `outstanding`, and changes nothing. The coordinator can't pick a scope for you, and two coordinators left in the same scope still mix up each other's tickets.
 - **Refusals don't raise.** Every acknowledgement answers with a `Recorded` or `Duplicate` whose phase is one of `HandoffMachines::PHASES`, or with a refusal from `HandoffMachines::REFUSALS`. Only malformed input raises.
 - **A refusal changes nothing.** Not the phase, not the window, not the clock.
 - **A repeat is not a refusal.** Every acknowledgement answers `Duplicate` when the transfer already recorded it with the same payload. Treat it as success. It changes nothing either. Only `activated` never does: it frees the slot, so its repeat is `:stale`.
@@ -340,7 +341,7 @@ Before the checkpoint, cancelling means telling the source to carry on. After th
 
 ## What's Yours
 
-The coordinator lives in your process and forgets everything when the process does. Write `generation` somewhere durable before you hand out a ticket, and build the next coordinator with `Handoff.restored(limits, last_generation)` so old tickets stay old. Transfers that were in flight are not restored: start them again, and let your lease authority's highest token decide who owns a partition that was mid-activation.
+The coordinator lives in your process and forgets everything when the process does. A fresh coordinator counts from 1 again, so a ticket that outlived a restart could name a new transfer. Either resume the sequence or give each incarnation a scope no earlier one used. To resume, write `generation` somewhere durable before you hand out a ticket, and build the next coordinator with `Handoff.restored(limits, scope, last_generation)` so old tickets stay old. The scope is yours to pass, never read out of the saved value: a value from another scope, one that lost its top bits, or a bare `0` for a non-zero scope raises `RangeError`. A coordinator that issued nothing answers `scope << 48`, and that is the only spelling of "nothing issued yet"; with no saved row at all, call `Handoff.with_scope`. Transfers that were in flight are not restored: start them again, and let your lease authority's highest token decide who owns a partition that was mid-activation.
 
 Replica ids are whatever you say they are. The coordinator compares them and cannot tell a restarted replica from an impostor. Fencing tokens must come from one serialized authority, and the resource they protect has to reject older ones atomically with each write. If you abort without a token while the authority might already have granted the target one, report the grant with `fenced` first.
 

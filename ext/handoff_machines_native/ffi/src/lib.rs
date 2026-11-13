@@ -48,6 +48,30 @@ impl Number {
     }
 }
 
+/// A scope: an Integer in `0..=65535`.
+#[derive(Clone, Copy)]
+struct Scope(u16);
+
+impl TryConvert for Scope {
+    fn try_convert(value: Value) -> Result<Self, Error> {
+        let ruby = Ruby::get_with(value);
+        if Integer::from_value(value).is_none() {
+            return Err(Error::new(
+                ruby.exception_type_error(),
+                "scope must be an Integer",
+            ));
+        }
+        u16::try_convert(value)
+            .map(Self)
+            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+    }
+}
+
+/// The scope a ticket's generation carries: `Ticket#scope`.
+const fn scope_of(generation: Number) -> u16 {
+    ticket(Number(0), generation).scope()
+}
+
 const fn ticket(partition: Number, generation: Number) -> Ticket {
     Ticket {
         partition: partition.0,
@@ -60,20 +84,48 @@ struct Handoff {
     core: RefCell<Core>,
 }
 
+fn limits(ruby: &Ruby, phase_budget: Number, per_replica: Number) -> Result<Limits, Error> {
+    Ok(Limits {
+        phase_budget: phase_budget.at(),
+        per_replica: per_replica.index(ruby)?,
+    })
+}
+
 impl Handoff {
+    fn with_scope(
+        ruby: &Ruby,
+        phase_budget: Number,
+        per_replica: Number,
+        scope: Scope,
+    ) -> Result<Self, Error> {
+        let limits = limits(ruby, phase_budget, per_replica)?;
+        Ok(Self {
+            core: RefCell::new(Core::with_scope(limits, scope.0)),
+        })
+    }
+
     fn restored(
         ruby: &Ruby,
         phase_budget: Number,
         per_replica: Number,
-        last_generation: Number,
+        saved: (Scope, Number),
     ) -> Result<Self, Error> {
-        let limits = Limits {
-            phase_budget: phase_budget.at(),
-            per_replica: per_replica.index(ruby)?,
-        };
-        Ok(Self {
-            core: RefCell::new(Core::restored(limits, last_generation.0)),
-        })
+        let limits = limits(ruby, phase_budget, per_replica)?;
+        let (scope, last_generation) = saved;
+        Core::restored(limits, scope.0, last_generation.0)
+            .map(|core| Self {
+                core: RefCell::new(core),
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    ruby.exception_range_error(),
+                    "last_generation is not a generation of this scope",
+                )
+            })
+    }
+
+    fn scope(&self) -> u16 {
+        self.core.borrow().scope()
     }
 
     fn limits(&self) -> (u128, usize) {

@@ -54,7 +54,7 @@ class HandoffTest < Minitest::Test
   def test_construction_mirrors_the_core
     handoff = H::Handoff.new(LIMITS)
     assert_equal [LIMITS, 0, 0], [handoff.limits, handoff.generation, handoff.active]
-    restored = H::Handoff.restored(LIMITS, 40)
+    restored = H::Handoff.restored(LIMITS, 0, 40)
     assert_equal [LIMITS, 40], [restored.limits, restored.generation]
     assert_equal H::Ticket.new(9, 41), restored.start(9, 1, 2, 10, 5, 0)
   end
@@ -263,7 +263,7 @@ class HandoffTest < Minitest::Test
     limited, = begun
     assert_instance_of H::Ticket, limited.start(1, 2, 3, 0, 1, 0)
     assert_equal :replica_busy, limited.start(2, 4, 2, 0, 1, 0)
-    exhausted = H::Handoff.restored(LIMITS, 2**64 - 1)
+    exhausted = H::Handoff.restored(LIMITS, 65_535, 2**64 - 1)
     assert_equal :exhausted, exhausted.start(1, 1, 2, 0, 1, 0)
     assert_equal 2**64 - 1, exhausted.generation
   end
@@ -303,7 +303,8 @@ class HandoffTest < Minitest::Test
     handoff, ticket = begun
     [1.0, nil, '1', Float::NAN].each do |bad|
       assert_raises(TypeError) { H::Handoff.new(H::Limits.new(bad, 1)) }
-      assert_raises(TypeError) { H::Handoff.restored(LIMITS, bad) }
+      assert_raises(TypeError) { H::Handoff.restored(LIMITS, 0, bad) }
+      assert_raises(TypeError) { H::Handoff.restored(LIMITS, bad, 0) }
       assert_raises(TypeError) { handoff.start(bad, 1, 2, 0, 1, 0) }
       assert_raises(TypeError) { handoff.start(1, 1, 2, 0, bad, 0) }
       assert_raises(TypeError) { handoff.quiesced(ticket, 1, 12, bad) }
@@ -327,14 +328,14 @@ class HandoffTest < Minitest::Test
     assert_raises(ArgumentError) { handoff.abort(ticket, 0) }
     assert_raises(ArgumentError) { H::Limits.new(per_replica: 1) }
     assert_raises(TypeError) { H::Handoff.allocate }
-    assert_raises(NoMethodError) { H::Handoff.native_restored(1, 1, 0) }
+    assert_raises(NoMethodError) { H::Handoff.native_restored(1, 1, [0, 0]) }
     assert_raises(NoMethodError) { handoff.native_abort(9, 1, nil, 0) }
     assert_equal :quiesce, handoff.status(9).phase
   end
 
   def test_u64_limits_and_freeze
     top = 2**64 - 1
-    handoff = H::Handoff.restored(LIMITS, top - 1)
+    handoff = H::Handoff.restored(LIMITS, 65_535, top - 1)
     ticket = handoff.start(top, top, 0, top - 1, top, top)
     assert_equal H::Ticket.new(top, top), ticket
     assert_equal top + (5 * SECOND), handoff.status(top).deadline

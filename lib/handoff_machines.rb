@@ -12,8 +12,13 @@ module HandoffMachines
   Limits = Data.define(:phase_budget, :per_replica)
 
   # One transfer: the partition and the generation it was issued under.
-  # Plain data, so it can travel to a replica and come back in its reply.
-  Ticket = Data.define(:partition, :generation)
+  # Plain data, so it can travel to a replica and come back in its reply. The
+  # generation carries the scope of the coordinator that issued it; a
+  # coordinator of another scope answers :unknown to the ticket.
+  Ticket = Data.define(:partition, :generation) do
+    # The scope of the coordinator that issued this ticket.
+    def scope = Handoff.__send__(:native_scope_of, generation)
+  end
 
   # Honoured acknowledgement, recorded for the first time; the transfer now
   # stands at `phase`.
@@ -55,17 +60,32 @@ module HandoffMachines
     private_constant :ACTIONS
 
     class << self
-      def new(limits)
-        restored(limits, 0)
+      # A fresh generation namespace in scope zero.
+      def new(limits) = with_scope(limits, 0)
+
+      # A fresh generation namespace whose generations carry `scope`, an
+      # Integer in 0..65_535. Give each coordinator its own.
+      def with_scope(limits, scope)
+        native_with_scope(*fields(limits), scope)
       end
 
-      def restored(limits, last_generation)
+      # Generations of `scope` above `last_generation`: what #generation
+      # answered on the previous coordinator of this namespace. RangeError when
+      # `last_generation` is of another scope, a bare 0 for a non-zero scope
+      # included: with nothing saved, call with_scope.
+      def restored(limits, scope, last_generation)
+        native_restored(*fields(limits), [scope, last_generation])
+      end
+
+      private
+
+      def fields(limits)
         raise TypeError, 'expected a HandoffMachines::Limits' unless limits.is_a?(Limits)
 
-        native_restored(limits.phase_budget, limits.per_replica, last_generation)
+        [limits.phase_budget, limits.per_replica]
       end
 
-      private :native_restored
+      private :native_with_scope, :native_restored, :native_scope_of
     end
 
     def limits

@@ -7,6 +7,7 @@ mod edges;
 mod model;
 mod random;
 mod replays;
+mod scope;
 
 pub const LIMITS: Limits = Limits {
     phase_budget: Duration::from_secs(5),
@@ -46,14 +47,24 @@ const TARGET: Recipient = Recipient::Replica(2);
 
 /// Partition 9 from replica 1 to replica 2, base 10, source token 5.
 pub fn begun() -> (Small, Ticket) {
-    let mut handoff = Small::new(LIMITS);
+    begun_in(0)
+}
+
+/// The same transfer on a coordinator of `scope`.
+pub fn begun_in(scope: u16) -> (Small, Ticket) {
+    let mut handoff = Small::with_scope(LIMITS, scope);
     let ticket = handoff.start(9, 1, 2, 10, token(5), at(0)).unwrap();
     (handoff, ticket)
 }
 
 /// Advance a fresh transfer through `steps` acknowledgements of the happy path.
 pub fn advanced(steps: usize) -> (Small, Ticket) {
-    let (mut h, t) = begun();
+    advanced_in(0, steps)
+}
+
+/// The same walk on a coordinator of `scope`.
+pub fn advanced_in(scope: u16, steps: usize) -> (Small, Ticket) {
+    let (mut h, t) = begun_in(scope);
     let acks: [&Ack; 6] = [
         &|h| h.quiesced(t, 1, 12, at(1)),
         &|h| {

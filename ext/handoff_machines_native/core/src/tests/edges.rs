@@ -61,7 +61,7 @@ fn time_regression_is_refused_and_deadlines_are_advisory() {
 
 #[test]
 fn u64_limits_fail_closed() {
-    let mut h = Small::restored(LIMITS, u64::MAX - 1);
+    let mut h = Small::restored(LIMITS, u16::MAX, u64::MAX - 1).unwrap();
     let top = token(u64::MAX);
     let t = h
         .start(u64::MAX, u64::MAX, 0, u64::MAX - 2, top, at(0))
