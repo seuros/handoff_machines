@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/seuros/handoff_machines/compare/handoff-machines-v0.3.0...handoff-machines-v0.4.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* handles are issued through periscope-machines. Every instance can be built with a scope; a handle from another scope is refused before any lookup; all handle kinds of an instance share one sequence; resumed restores the sequence after a restart. restored(limits, scope, last_generation) returns an Option.
+
+### Features
+
+* scope ticket generations through periscope-machines; restored takes the scope and refuses a saved generation from another scope ([978b653](https://github.com/seuros/handoff_machines/commit/978b653d386062d925d002370930bf09d2d2dbf8))
+
 ## [0.3.0](https://github.com/seuros/handoff_machines/compare/handoff-machines-v0.2.0...handoff-machines-v0.3.0) (2026-11-13)
 
 
