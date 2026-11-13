@@ -7,6 +7,7 @@ class HandoffTest < Minitest::Test
   SECOND = 1_000_000_000
   LIMITS = H::Limits.new(5 * SECOND, 2)
 
+  def tok(raw) = H::FencingToken.from_raw(raw)
   def rec(phase) = H::Recorded.new(phase)
   def again(phase) = H::Duplicate.new(phase)
   def replica(id) = H::Replica.new(id)
@@ -15,7 +16,7 @@ class HandoffTest < Minitest::Test
 
   # Partition 9 from replica 1 to replica 2, offsets below 10 committed, source token 5.
   def begun(handoff = H::Handoff.new(LIMITS), partition: 9)
-    [handoff, handoff.start(partition, 1, 2, 10, 5, 0)]
+    [handoff, handoff.start(partition, 1, 2, 10, tok(5), 0)]
   end
 
   def advanced(steps)
@@ -25,7 +26,7 @@ class HandoffTest < Minitest::Test
       -> { [11, 10].each { |offset| handoff.drained(ticket, 1, offset, 1) } },
       -> { handoff.captured(ticket, 1, 77, 1) },
       -> { handoff.installed(ticket, 2, 77, 1) },
-      -> { handoff.fenced(ticket, 6, 1) }
+      -> { handoff.fenced(ticket, tok(6), 1) }
     ].first(steps).each(&:call)
     [handoff, ticket]
   end
@@ -56,7 +57,7 @@ class HandoffTest < Minitest::Test
     assert_equal [LIMITS, 0, 0], [handoff.limits, handoff.generation, handoff.active]
     restored = H::Handoff.restored(LIMITS, 0, 40)
     assert_equal [LIMITS, 40], [restored.limits, restored.generation]
-    assert_equal H::Ticket.new(9, 41), restored.start(9, 1, 2, 10, 5, 0)
+    assert_equal H::Ticket.new(9, 41), restored.start(9, 1, 2, 10, tok(5), 0)
   end
 
   def test_happy_path_and_orders
@@ -74,14 +75,14 @@ class HandoffTest < Minitest::Test
     assert_equal rec(:checkpoint), handoff.captured(ticket, 1, 77, 2)
     assert_equal [H::Order.new(ticket, replica(2), H::Install.new(77))], orders(handoff)
     assert_equal rec(:activate), handoff.installed(ticket, 2, 77, 3)
-    assert_equal [H::Order.new(ticket, :authority, H::Fence.new(5))], orders(handoff)
-    assert_equal rec(:activate), handoff.fenced(ticket, 6, 3)
-    assert_equal [H::Order.new(ticket, replica(2), H::Activate.new(6))], orders(handoff)
-    expected = H::Status.new(ticket, 1, 2, :activate, 10, 12, 77, 6, 3 + (5 * SECOND))
+    assert_equal [H::Order.new(ticket, :authority, H::Fence.new(tok(5)))], orders(handoff)
+    assert_equal rec(:activate), handoff.fenced(ticket, tok(6), 3)
+    assert_equal [H::Order.new(ticket, replica(2), H::Activate.new(tok(6)))], orders(handoff)
+    expected = H::Status.new(ticket, 1, 2, :activate, 10, 12, 77, tok(6), 3 + (5 * SECOND))
     assert_equal expected, handoff.status(9)
-    assert_equal rec(:complete), handoff.activated(ticket, 2, 6, 4)
+    assert_equal rec(:complete), handoff.activated(ticket, 2, tok(6), 4)
     assert_equal [0, nil, []], [handoff.active, handoff.status(9), orders(handoff)]
-    assert_equal :stale, handoff.activated(ticket, 2, 6, 4)
+    assert_equal :stale, handoff.activated(ticket, 2, tok(6), 4)
   end
 
   def test_abort_from_each_phase
@@ -106,9 +107,9 @@ class HandoffTest < Minitest::Test
   def test_abort_after_activation_needs_a_newer_token
     handoff, ticket = advanced(5)
     assert_equal :fence_required, handoff.abort(ticket, nil, 2)
-    assert_equal :stale_token, handoff.abort(ticket, 6, 2)
-    assert_equal rec(:rollback), handoff.abort(ticket, 7, 2)
-    owed = [H::Order.new(ticket, replica(1), H::Resume.new(7)), H::Order.new(ticket, replica(2), :discard)]
+    assert_equal :stale_token, handoff.abort(ticket, tok(6), 2)
+    assert_equal rec(:rollback), handoff.abort(ticket, tok(7), 2)
+    owed = [H::Order.new(ticket, replica(1), H::Resume.new(tok(7))), H::Order.new(ticket, replica(2), :discard)]
     assert_equal owed, orders(handoff)
     assert_equal rec(:rollback), handoff.resumed(ticket, 1, 2)
     assert_equal again(:rollback), handoff.resumed(ticket, 1, 2)
@@ -135,7 +136,7 @@ class HandoffTest < Minitest::Test
       -> { handoff.committed(ticket, 1, 10, late) },
       -> { handoff.captured(ticket, 1, 77, late) },
       -> { handoff.installed(ticket, 2, 77, late) },
-      -> { handoff.fenced(ticket, 6, late) }
+      -> { handoff.fenced(ticket, tok(6), late) }
     ]
   end
 
@@ -144,21 +145,21 @@ class HandoffTest < Minitest::Test
     handoff, ticket = advanced(5)
     assert_unchanged(handoff, forward(handoff, ticket, late).map { |call| [call, again(:activate)] })
     assert_equal 1 + (5 * SECOND), handoff.status(9).deadline
-    assert_equal rec(:rollback), handoff.abort(ticket, 7, 2)
+    assert_equal rec(:rollback), handoff.abort(ticket, tok(7), 2)
     assert_unchanged(handoff, forward(handoff, ticket, late).map { |call| [call, again(:rollback)] })
     assert_unchanged(
       handoff,
       [
-        [-> { handoff.abort(ticket, 7, late) }, again(:rollback)],
-        [-> { handoff.abort(ticket, 8, late) }, :mismatch],
+        [-> { handoff.abort(ticket, tok(7), late) }, again(:rollback)],
+        [-> { handoff.abort(ticket, tok(8), late) }, :mismatch],
         [-> { handoff.abort(ticket, nil, late) }, :mismatch],
-        [-> { handoff.activated(ticket, 2, 6, late) }, :out_of_phase],
+        [-> { handoff.activated(ticket, 2, tok(6), late) }, :out_of_phase],
         [-> { handoff.quiesced(ticket, 1, 12, 0) }, :clock_regressed]
       ]
     )
     assert_equal rec(:rollback), handoff.resumed(ticket, 1, 3)
     assert_equal rec(:aborted), handoff.discarded(ticket, 2, 3)
-    (forward(handoff, ticket, late) << -> { handoff.abort(ticket, 7, late) }).each do |call|
+    (forward(handoff, ticket, late) << -> { handoff.abort(ticket, tok(7), late) }).each do |call|
       assert_equal :stale, call.call
     end
   end
@@ -174,7 +175,7 @@ class HandoffTest < Minitest::Test
       assert_unchanged(handoff, [[-> { handoff.abort(ticket, nil, 9) }, again(:rollback)]])
     end
     handoff, ticket = begun
-    early = forward(handoff, ticket, 0).drop(1) << -> { handoff.activated(ticket, 2, 6, 0) }
+    early = forward(handoff, ticket, 0).drop(1) << -> { handoff.activated(ticket, 2, tok(6), 0) }
     early.push(-> { handoff.resumed(ticket, 1, 0) }, -> { handoff.discarded(ticket, 2, 0) })
     assert_unchanged(handoff, early.map { |call| [call, :out_of_phase] })
   end
@@ -190,8 +191,8 @@ class HandoffTest < Minitest::Test
         [-> { handoff.captured(ticket, 2, 77, 9) }, :wrong_replica],
         [-> { handoff.installed(ticket, 2, 78, 9) }, :mismatch],
         [-> { handoff.installed(ticket, 1, 77, 9) }, :wrong_replica],
-        [-> { handoff.fenced(ticket, 7, 9) }, :mismatch],
-        [-> { handoff.fenced(ticket, 5, 9) }, :mismatch],
+        [-> { handoff.fenced(ticket, tok(7), 9) }, :mismatch],
+        [-> { handoff.fenced(ticket, tok(5), 9) }, :mismatch],
         [-> { handoff.drained(ticket, 1, 12, 9) }, :beyond_drain],
         [-> { handoff.drained(ticket, 2, 10, 9) }, :wrong_replica],
         [-> { handoff.committed(ticket, 1, 11, 9) }, :out_of_phase],
@@ -213,8 +214,8 @@ class HandoffTest < Minitest::Test
       assert_equal refusal, handoff.committed(ticket, 1, 11, 0)
       assert_equal refusal, handoff.captured(ticket, 1, 7, 0)
       assert_equal refusal, handoff.installed(ticket, 2, 7, 0)
-      assert_equal refusal, handoff.fenced(ticket, 6, 0)
-      assert_equal refusal, handoff.activated(ticket, 2, 6, 0)
+      assert_equal refusal, handoff.fenced(ticket, tok(6), 0)
+      assert_equal refusal, handoff.activated(ticket, 2, tok(6), 0)
       assert_equal refusal, handoff.abort(ticket, nil, 0)
       assert_equal refusal, handoff.resumed(ticket, 1, 0)
       assert_equal refusal, handoff.discarded(ticket, 2, 0)
@@ -245,32 +246,32 @@ class HandoffTest < Minitest::Test
     handoff, ticket = advanced(3)
     assert_equal :mismatch, handoff.installed(ticket, 2, 78, 1)
     handoff, ticket = advanced(4)
-    assert_equal :stale_token, handoff.fenced(ticket, 5, 1)
+    assert_equal :stale_token, handoff.fenced(ticket, tok(5), 1)
     handoff, ticket = advanced(5)
-    assert_equal :mismatch, handoff.activated(ticket, 2, 7, 1)
+    assert_equal :mismatch, handoff.activated(ticket, 2, tok(7), 1)
   end
 
   def test_bounded_concurrent_transfers
     handoff = H::Handoff.new(H::Limits.new(5 * SECOND, 16))
-    tickets = H::CAPACITY.times.map { |i| handoff.start(i, 1, 2, 0, 1, 0) }
+    tickets = H::CAPACITY.times.map { |i| handoff.start(i, 1, 2, 0, tok(1), 0) }
     assert_equal (1..16).to_a, tickets.map(&:generation)
-    assert_equal :full, handoff.start(99, 1, 2, 0, 1, 0)
-    assert_equal :busy, handoff.start(0, 1, 2, 0, 1, 0)
-    assert_equal :same_replica, handoff.start(99, 1, 1, 0, 1, 0)
+    assert_equal :full, handoff.start(99, 1, 2, 0, tok(1), 0)
+    assert_equal :busy, handoff.start(0, 1, 2, 0, tok(1), 0)
+    assert_equal :same_replica, handoff.start(99, 1, 1, 0, tok(1), 0)
     assert_equal rec(:rollback), handoff.abort(tickets.first, nil, 0)
     assert_equal rec(:aborted), handoff.resumed(tickets.first, 1, 0)
-    assert_equal 17, handoff.start(99, 1, 2, 0, 1, 0).generation
+    assert_equal 17, handoff.start(99, 1, 2, 0, tok(1), 0).generation
     limited, = begun
-    assert_instance_of H::Ticket, limited.start(1, 2, 3, 0, 1, 0)
-    assert_equal :replica_busy, limited.start(2, 4, 2, 0, 1, 0)
+    assert_instance_of H::Ticket, limited.start(1, 2, 3, 0, tok(1), 0)
+    assert_equal :replica_busy, limited.start(2, 4, 2, 0, tok(1), 0)
     exhausted = H::Handoff.restored(LIMITS, 65_535, 2**64 - 1)
-    assert_equal :exhausted, exhausted.start(1, 1, 2, 0, 1, 0)
+    assert_equal :exhausted, exhausted.start(1, 1, 2, 0, tok(1), 0)
     assert_equal 2**64 - 1, exhausted.generation
   end
 
   def test_orders_and_overdue_resume_in_bounded_chunks
     handoff = H::Handoff.new(H::Limits.new(5 * SECOND, 16))
-    tickets = 5.times.map { |i| handoff.start(i, 1, 2, 0, 1, i * SECOND) }
+    tickets = 5.times.map { |i| handoff.start(i, 1, 2, 0, tok(1), i * SECOND) }
     all = orders(handoff)
     assert_equal tickets, all.map(&:ticket)
     seen = []
@@ -295,7 +296,7 @@ class HandoffTest < Minitest::Test
     assert_equal rec(:drain), handoff.quiesced(ticket, 1, 12, 3)
     assert_equal :clock_regressed, handoff.drained(ticket, 1, 10, 2)
     assert_equal :clock_regressed, handoff.abort(ticket, nil, 2)
-    assert_equal :clock_regressed, handoff.start(1, 3, 4, 0, 1, 2)
+    assert_equal :clock_regressed, handoff.start(1, 3, 4, 0, tok(1), 2)
     assert_equal rec(:drain), handoff.drained(ticket, 1, 10, 3)
   end
 
@@ -305,7 +306,7 @@ class HandoffTest < Minitest::Test
       assert_raises(TypeError) { H::Handoff.new(H::Limits.new(bad, 1)) }
       assert_raises(TypeError) { H::Handoff.restored(LIMITS, 0, bad) }
       assert_raises(TypeError) { H::Handoff.restored(LIMITS, bad, 0) }
-      assert_raises(TypeError) { handoff.start(bad, 1, 2, 0, 1, 0) }
+      assert_raises(TypeError) { handoff.start(bad, 1, 2, 0, tok(1), 0) }
       assert_raises(TypeError) { handoff.start(1, 1, 2, 0, bad, 0) }
       assert_raises(TypeError) { handoff.quiesced(ticket, 1, 12, bad) }
       assert_raises(TypeError) { handoff.quiesced(bad, 1, 12, 0) }
@@ -314,15 +315,14 @@ class HandoffTest < Minitest::Test
       assert_raises(TypeError) { handoff.orders(0, bad) }
     end
     assert_raises(TypeError) { handoff.abort(ticket, '7', 0) }
-    assert_raises(TypeError) { handoff.fenced([9, 1], 6, 0) }
+    assert_raises(TypeError) { handoff.fenced([9, 1], tok(6), 0) }
     assert_raises(TypeError) { H::Handoff.new([5 * SECOND, 2]) }
     [-1, 2**64].each do |bad|
       assert_raises(RangeError) { handoff.quiesced(ticket, bad, 12, 0) }
       assert_raises(RangeError) { handoff.orders(bad, 1) }
       assert_raises(RangeError) { H::Handoff.new(H::Limits.new(1, bad)) }
     end
-    assert_raises(RangeError) { handoff.fenced(ticket, 0, 0) }
-    assert_raises(RangeError) { handoff.start(1, 3, 4, 0, 0, 0) }
+    assert_raises(RangeError) { tok(0) }
     assert_raises(ArgumentError) { H::Handoff.new }
     assert_raises(ArgumentError) { handoff.orders }
     assert_raises(ArgumentError) { handoff.abort(ticket, 0) }
@@ -336,7 +336,7 @@ class HandoffTest < Minitest::Test
   def test_u64_limits_and_freeze
     top = 2**64 - 1
     handoff = H::Handoff.restored(LIMITS, 65_535, top - 1)
-    ticket = handoff.start(top, top, 0, top - 1, top, top)
+    ticket = handoff.start(top, top, 0, top - 1, tok(top), top)
     assert_equal H::Ticket.new(top, top), ticket
     assert_equal top + (5 * SECOND), handoff.status(top).deadline
     assert_equal rec(:drain), handoff.quiesced(ticket, top, top, top)
@@ -346,7 +346,7 @@ class HandoffTest < Minitest::Test
     handoff.freeze
     assert_raises(FrozenError) { handoff.drained(ticket, top, top - 1, top) }
     assert_raises(FrozenError) { handoff.abort(ticket, nil, top) }
-    assert_raises(FrozenError) { handoff.start(1, 1, 2, 0, 1, top) }
+    assert_raises(FrozenError) { handoff.start(1, 1, 2, 0, tok(1), top) }
     assert_equal [:drain, LIMITS], [handoff.status(top).phase, handoff.limits]
     assert_equal 1, orders(handoff).size
   end

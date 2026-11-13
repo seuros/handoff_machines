@@ -50,6 +50,23 @@ issue fencing tokens, send messages or persist anything.
   one in-flight offset at a time), `captured` (source, checkpoint identity),
   `installed` (target, the same identity), `fenced` (the authority's token,
   strictly above the source's), `activated` (target, the same token).
+- Fencing tokens are `lease-machines` `FencingToken`s, re-exported here, and
+  they carry their authority's scope. Tokens of two scopes have no order, so a
+  transfer reads tokens only inside its source token's scope. `fenced`,
+  `activated` and `abort` answer `Unknown` to a token of any other scope,
+  whatever its number, and they answer it first: after the clock and the
+  ticket, before the transfer's phase, the replica or any recorded token is
+  looked at. `Unknown` is the name every crate gives an id that is not of
+  the namespace the call reads it in; a foreign token is never folded into
+  "older" (`StaleToken`), "not the one recorded" (`Mismatch`) or "not now"
+  (`OutOfPhase`). Those three are only ever said of a token of the
+  transfer's scope: `StaleToken` when it does not exceed the ones the
+  transfer knows, `Mismatch` when a different one is recorded. `start` has
+  nothing to compare its source token with: that token names the scope.
+  One transfer therefore lives under one authority scope: if
+  the authority came back under a new scope before `fenced`, give the
+  transfer up with an unfenced `abort` and start it again under a source
+  token of the new scope.
 - Drain readiness is an `offset-machines` `Tracker` per transfer, assigned at the
   transfer's generation: the phase ends when the contiguous acknowledged prefix
   reaches the quiesce point. `committed` slides the window for drains wider
@@ -89,16 +106,25 @@ issue fencing tokens, send messages or persist anything.
   the transfer was given up first. `activated` and the acknowledgement that
   ends a rollback free the slot, so their repeats are `Stale` like any other
   finished ticket's.
+- Checks run in one order, and the first that fails is the answer. Every
+  acknowledgement: `ClockRegressed`, then the ticket (`Unknown`, `Stale`).
+  Then, for the three that take a fencing token:
+
+  | Call | After the clock and the ticket |
+  | --- | --- |
+  | `fenced` | `Unknown` (token scope), then `Duplicate` or `Mismatch` against a recorded token, `OutOfPhase`, `StaleToken` |
+  | `activated` | `Unknown` (token scope), `OutOfPhase`, `WrongReplica`, `Mismatch` |
+  | `abort` | `Unknown` (token scope, when a token is given), then `Duplicate` or `Mismatch` during a rollback, `StaleToken`, `FenceRequired` |
 
 ```rust
 use core::time::Duration;
-use handoff_machines::{Acked, Action, FencingToken, Handoff, Limits, Phase, Recipient};
+use handoff_machines::{Acked, Action, FencingToken, Handoff, Limits, Phase, Recipient, Refusal};
 
 # fn example() -> Option<()> {
 let limits = Limits { phase_budget: Duration::from_secs(30), per_replica: 2 };
 let mut handoff = Handoff::<8, 4>::new(limits); // 8 transfers, 256-offset drains
 let now = Duration::ZERO;
-let held = FencingToken::new(7)?;
+let held = FencingToken::from_raw(7)?; // scope zero, sequence 7
 // Partition 42 from replica 1 to replica 2; offsets below 100 are committed.
 let ticket = handoff.start(42, 1, 2, 100, held, now).ok()?;
 let order = handoff.orders(0).next()?;
@@ -113,7 +139,11 @@ assert_eq!(handoff.outstanding(ticket, 0).ok()?.next(), Some(100));
 assert_eq!(handoff.drained(ticket, 1, 100, now), acked(Phase::Checkpoint));
 assert_eq!(handoff.captured(ticket, 1, 9, now), acked(Phase::Checkpoint));
 assert_eq!(handoff.installed(ticket, 2, 9, now), acked(Phase::Activate));
-let granted = FencingToken::new(8)?; // from your lease authority
+let granted = FencingToken::from_raw(8)?; // from your lease authority
+// A token of another authority's scope has no order against the source's.
+let foreign = FencingToken::from_raw((3 << 48) | 8)?;
+assert_eq!(handoff.fenced(ticket, foreign, now), Err(Refusal::Unknown));
+assert_eq!(handoff.fenced(ticket, held, now), Err(Refusal::StaleToken));
 assert_eq!(handoff.fenced(ticket, granted, now), acked(Phase::Activate));
 assert_eq!(handoff.activated(ticket, 2, granted, now), acked(Phase::Complete));
 assert_eq!(handoff.active(), 0);
@@ -130,7 +160,7 @@ assert_eq!(handoff.active(), 0);
 2. **Serialized fenced activation.** The token passed to `fenced` must come from
    one serialized authority (`lease-machines` models its decisions), and the
    resource must reject lower tokens atomically with each write. The coordinator
-   only checks that the token is above the source's. Without resource-side
+   only checks that the token is of the source token's scope and above it. Without resource-side
    fencing, a source that missed `Quiesce` keeps writing.
 3. **Transfer replay protection.** Generations refuse stale acknowledgements
    inside one coordinator lifetime. Across restarts, persist `generation()` before

@@ -20,6 +20,9 @@ module HandoffMachines
   # Refusals every acknowledgement can answer for its ticket and clock.
   # :unknown is a ticket this coordinator never issued, which includes every
   # ticket of another scope; :stale is one it issued that is no longer live.
+  # `fenced`, `activated` and `abort` also answer :unknown to a fencing token
+  # of another scope than the transfer's source token, after the clock and
+  # the ticket and before anything else is checked.
   type ticket_refusal = :clock_regressed | :stale | :unknown
   # Honoured acknowledgement, the core's `Acked`. Recorded: the transfer now
   # stands at `phase`. Duplicate: an idempotent repeat of an acknowledgement
@@ -32,6 +35,29 @@ module HandoffMachines
   type recipient = Replica | :authority
   # The core's `Action`: a Data per variant with a field, a symbol otherwise.
   type action = :quiesce | Drain | Capture | Install | Fence | Activate | Resume | :discard
+
+  # Anything read as a fencing token: this gem's FencingToken, or the
+  # `lease_machines` gem's. A bare Integer is not one (TypeError).
+  interface _FencingToken
+    def raw: () -> Integer
+  end
+
+  # The lease core's `FencingToken`, which the handoff core re-exports.
+  class FencingToken < Data
+    # Scope in the top 16 bits above a sequence number counted from 1.
+    attr_reader raw: Integer
+    # TypeError for a non-Integer; RangeError outside 1..2**64-1 or when the
+    # sequence number is zero.
+    def self.new: (Integer raw) -> FencingToken
+                | (raw: Integer) -> FencingToken
+    def self.from_raw: (Integer raw) -> FencingToken
+    # The scope of the authority that issued this token.
+    def scope: () -> Integer
+    # nil across scopes: such tokens are not comparable.
+    def order: (_FencingToken other) -> (-1 | 0 | 1)?
+    # False across scopes.
+    def newer_than?: (_FencingToken other) -> bool
+  end
 
   class Limits < Data
     attr_reader phase_budget: nanoseconds
@@ -91,25 +117,25 @@ module HandoffMachines
                 | (checkpoint: Integer) -> Install
   end
 
-  # Authority: issue the target a token strictly greater than `above`.
+  # Authority: issue the target a token of `above`'s scope, strictly newer.
   class Fence < Data
-    attr_reader above: Integer
-    def self.new: (Integer above) -> Fence
-                | (above: Integer) -> Fence
+    attr_reader above: FencingToken
+    def self.new: (FencingToken above) -> Fence
+                | (above: FencingToken) -> Fence
   end
 
   # Target: start serving under `token`.
   class Activate < Data
-    attr_reader token: Integer
-    def self.new: (Integer token) -> Activate
-                | (token: Integer) -> Activate
+    attr_reader token: FencingToken
+    def self.new: (FencingToken token) -> Activate
+                | (token: FencingToken) -> Activate
   end
 
   # Source: resume serving; under `token` when the rollback was fenced.
   class Resume < Data
-    attr_reader token: Integer?
-    def self.new: (Integer? token) -> Resume
-                | (token: Integer?) -> Resume
+    attr_reader token: FencingToken?
+    def self.new: (FencingToken? token) -> Resume
+                | (token: FencingToken?) -> Resume
   end
 
   class Order < Data
@@ -128,10 +154,10 @@ module HandoffMachines
     attr_reader base: Integer
     attr_reader until: Integer?
     attr_reader checkpoint: Integer?
-    attr_reader token: Integer?
+    attr_reader token: FencingToken?
     attr_reader deadline: nanoseconds
     def self.new: (Ticket ticket, Integer source, Integer target, phase phase, Integer base, Integer? until_offset,
-                   Integer? checkpoint, Integer? token, nanoseconds deadline) -> Status
+                   Integer? checkpoint, FencingToken? token, nanoseconds deadline) -> Status
   end
 
   # The core's `Handoff<16, 4>`. Honoured answers come first in every return
@@ -149,7 +175,8 @@ module HandoffMachines
     def self.restored: (Limits limits, Integer scope, Integer last_generation) -> Handoff
     def scope: () -> Integer
     def limits: () -> Limits
-    def start: (Integer partition, Integer source, Integer target, Integer base, Integer source_token,
+    # `source_token`'s scope is the transfer's token scope.
+    def start: (Integer partition, Integer source, Integer target, Integer base, _FencingToken source_token,
                 nanoseconds now)
                -> (Ticket | :clock_regressed | :same_replica | :busy | :full | :replica_busy | :exhausted)
     # Recorded(:drain | :checkpoint), or Duplicate.
@@ -167,15 +194,23 @@ module HandoffMachines
     # Recorded(:activate), or Duplicate.
     def installed: (Ticket ticket, Integer replica, Integer checkpoint, nanoseconds now)
                    -> (acked | ticket_refusal | :out_of_phase | :wrong_replica | :mismatch)
-    # Recorded(:activate), or Duplicate.
-    def fenced: (Ticket ticket, Integer token, nanoseconds now)
-                -> (acked | ticket_refusal | :out_of_phase | :stale_token | :mismatch)
-    # Recorded(:complete); never Duplicate, a repeat is :stale.
-    def activated: (Ticket ticket, Integer replica, Integer token, nanoseconds now)
+    # Recorded(:activate), or Duplicate. In order, after the ticket refusals:
+    # :unknown for a token of another scope than the source token's; then
+    # :mismatch when a different token is recorded; :out_of_phase;
+    # :stale_token for one not newer than the source token.
+    def fenced: (Ticket ticket, _FencingToken token, nanoseconds now)
+                -> (acked | ticket_refusal | :mismatch | :out_of_phase | :stale_token)
+    # Recorded(:complete); never Duplicate, a repeat is :stale. In order,
+    # after the ticket refusals: :unknown for a token of another scope;
+    # :out_of_phase; :wrong_replica; :mismatch.
+    def activated: (Ticket ticket, Integer replica, _FencingToken token, nanoseconds now)
                    -> (Recorded | ticket_refusal | :out_of_phase | :wrong_replica | :mismatch)
     # Recorded(:rollback), or Duplicate. `token` is nil for an unfenced abort.
-    def abort: (Ticket ticket, Integer? token, nanoseconds now)
-               -> (acked | ticket_refusal | :stale_token | :fence_required | :mismatch)
+    # In order, after the ticket refusals: :unknown for a token of another
+    # scope; :mismatch during a rollback under another token; :stale_token
+    # for one not newer than every token the transfer knows; :fence_required.
+    def abort: (Ticket ticket, _FencingToken? token, nanoseconds now)
+               -> (acked | ticket_refusal | :mismatch | :stale_token | :fence_required)
     # Recorded(:rollback | :aborted), or Duplicate.
     def resumed: (Ticket ticket, Integer replica, nanoseconds now)
                  -> (acked | ticket_refusal | :out_of_phase | :wrong_replica)
@@ -193,6 +228,8 @@ module HandoffMachines
     private
 
     ACTIONS: Hash[Symbol, singleton(Data)]
+    TOKENED: Array[Symbol]
+    def raw: (_FencingToken) -> Integer
     def self.fields: (Limits) -> [Integer, Integer]
     def self.native_with_scope: (Integer, Integer, Integer) -> Handoff
     def self.native_restored: (Integer, Integer, [Integer, Integer]) -> Handoff
@@ -216,5 +253,15 @@ module HandoffMachines
     def native_orders: (Integer, Integer) -> [Array[Array[untyped]], Integer]
     def native_outstanding: (Integer, Integer, Integer, Integer) -> (Array[Integer] | refusal)
     def native_overdue: (Integer, Integer, Integer) -> [Array[[Integer, Integer]], Integer]
+  end
+
+  private
+
+  def self.native_token_scope: (Integer) -> Integer
+  def self.native_token_order: (Integer, Integer) -> (-1 | 0 | 1)?
+  def self.native_token_newer: (Integer, Integer) -> bool
+
+  module Rows
+    def self?.raw: (_FencingToken) -> Integer
   end
 end

@@ -8,6 +8,7 @@ mod model;
 mod random;
 mod replays;
 mod scope;
+mod tokens;
 
 pub const LIMITS: Limits = Limits {
     phase_budget: Duration::from_secs(5),
@@ -18,8 +19,14 @@ pub fn at(seconds: u64) -> Duration {
     Duration::from_secs(seconds)
 }
 
-pub fn token(value: u64) -> FencingToken {
-    FencingToken::new(value).unwrap()
+/// The token whose raw value is `raw`: in scope zero, its sequence number.
+pub fn token(raw: u64) -> FencingToken {
+    FencingToken::from_raw(raw).unwrap()
+}
+
+/// Token `sequence` of `scope`.
+pub fn token_in(scope: u16, sequence: u64) -> FencingToken {
+    token(scoped(scope, sequence))
 }
 
 pub type Small = Handoff<2, 1>;

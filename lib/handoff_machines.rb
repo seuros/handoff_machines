@@ -7,6 +7,52 @@ require 'handoff_machines_native/handoff_machines_native'
 # Every value mirrors the core type of the same name, field for field. Every
 # instant and span (`now`, `phase_budget`, `deadline`) is Integer nanoseconds.
 module HandoffMachines
+  class << self
+    private :native_token_scope, :native_token_order, :native_token_newer
+  end
+
+  # A fencing token, the lease core's `FencingToken` which the handoff core
+  # re-exports: the issuing authority's scope in the top 16 bits of `raw`
+  # above a sequence number counted from 1. The coordinator issues none: bring
+  # them from your authority. Every method that takes a token reads its `raw`,
+  # so the `lease_machines` gem's FencingToken fits as it is, and this gem does
+  # not depend on that one. A bare Integer is not a token: TypeError.
+  #
+  # Tokens of one scope are ordered; tokens of two scopes are not, so there is
+  # no `<` or `<=>`. Compare with `order` and `newer_than?`.
+  FencingToken = Data.define(:raw) do
+    # The core's `FencingToken::from_raw`. RangeError when the sequence number
+    # is zero, which no authority issues.
+    def self.from_raw(raw) = new(raw)
+
+    def initialize(raw:)
+      HandoffMachines.__send__(:native_token_scope, raw)
+      super
+    end
+
+    # The scope of the authority that issued this token.
+    def scope = HandoffMachines.__send__(:native_token_scope, raw)
+
+    # -1, 0 or 1 against a token of the same scope; nil across scopes.
+    def order(other) = HandoffMachines.__send__(:native_token_order, raw, Rows.raw(other))
+
+    # Whether this token is of `other`'s scope and strictly newer. False across
+    # scopes, so its negation does not mean "older or equal".
+    def newer_than?(other) = HandoffMachines.__send__(:native_token_newer, raw, Rows.raw(other))
+  end
+  # What the native extension trades in: a token is read by its `raw`,
+  # whichever gem defined it.
+  module Rows
+    module_function
+
+    def raw(token)
+      raise TypeError, 'expected a fencing token (no #raw)' unless token.respond_to?(:raw)
+
+      token.raw
+    end
+  end
+  private_constant :Rows
+
   # Admission and timing limits: how long one phase may last before `overdue`
   # reports the transfer, and how many transfers one replica may take part in.
   Limits = Data.define(:phase_budget, :per_replica)
@@ -57,7 +103,9 @@ module HandoffMachines
     ACTIONS = {
       drain: Drain, capture: Capture, install: Install, fence: Fence, activate: Activate, resume: Resume
     }.freeze
-    private_constant :ACTIONS
+    # The actions whose field is a fencing token.
+    TOKENED = %i[fence activate resume].freeze
+    private_constant :ACTIONS, :TOKENED
 
     class << self
       # A fresh generation namespace in scope zero.
@@ -93,7 +141,7 @@ module HandoffMachines
     end
 
     def start(partition, source, target, base, source_token, now)
-      started = native_start(partition, [source, target], base, source_token, now)
+      started = native_start(partition, [source, target], base, raw(source_token), now)
       started.is_a?(Symbol) ? started : Ticket.new(*started)
     end
 
@@ -118,16 +166,16 @@ module HandoffMachines
     end
 
     def fenced(ticket, token, now)
-      acked(native_fenced(*key(ticket), token, now))
+      acked(native_fenced(*key(ticket), raw(token), now))
     end
 
     def activated(ticket, replica, token, now)
-      acked(native_activated(*key(ticket), replica, token, now))
+      acked(native_activated(*key(ticket), replica, raw(token), now))
     end
 
     # `token` is nil for an unfenced abort.
     def abort(ticket, token, now)
-      acked(native_abort(*key(ticket), token, now))
+      acked(native_abort(*key(ticket), token && raw(token), now))
     end
 
     def resumed(ticket, replica, now)
@@ -142,7 +190,8 @@ module HandoffMachines
       head, tail = native_status(partition)
       return unless head
 
-      Status.new(Ticket.new(head[0], head[1]), *head[2..], *tail)
+      granted = tail[3] && FencingToken.new(tail[3])
+      Status.new(Ticket.new(head[0], head[1]), *head[2..], *tail[0..2], granted, tail[4])
     end
 
     # At most `limit` orders from position `from` (zero to begin), and the
@@ -172,6 +221,8 @@ module HandoffMachines
       [ticket.partition, ticket.generation]
     end
 
+    def raw(token) = Rows.raw(token)
+
     def acked(answer)
       return answer if answer.is_a?(Symbol)
 
@@ -181,6 +232,7 @@ module HandoffMachines
 
     def order(partition, generation, recipient, name, field)
       to = recipient.is_a?(Symbol) ? recipient : Replica.new(recipient)
+      field = FencingToken.new(field) if field && TOKENED.include?(name)
       action = ACTIONS.key?(name) ? ACTIONS.fetch(name).new(field) : name
       Order.new(Ticket.new(partition, generation), to, action)
     end

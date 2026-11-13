@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, format, string::String, vec::Vec};
 use super::model::{Model, Wait};
 use super::{LIMITS, token};
 use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Ticket};
-use periscope_machines::{scoped, sequence_of};
+use periscope_machines::{scope_of, scoped, sequence_of};
 
 const N: usize = 4;
 const WORDS: usize = 1;
@@ -42,6 +42,17 @@ impl Draws {
     }
 }
 
+/// Token `sequence` as a raw value: of the run's token scope `home`, or one
+/// time in twelve of a neighbouring scope, whose raw values lie above or below.
+fn fencing(sequence: u64, home: u16, d: &mut Draws) -> u64 {
+    let scope = match d.below(24) {
+        0 => home.wrapping_add(1),
+        1 => home.wrapping_sub(1),
+        _ => home,
+    };
+    scoped(scope, sequence)
+}
+
 fn sorted(orders: impl IntoIterator<Item = Order>) -> Vec<String> {
     let mut lines: Vec<String> = orders.into_iter().map(|o| format!("{o:?}")).collect();
     lines.sort();
@@ -52,6 +63,8 @@ struct Run {
     core: Handoff<N, WORDS>,
     model: Model,
     draws: Draws,
+    /// The scope of the authority whose tokens the transfers are fenced by.
+    home: u16,
     now: Duration,
     tickets: Vec<Ticket>,
     seen: BTreeSet<String>,
@@ -71,6 +84,7 @@ impl Run {
                 window: 64,
             },
             draws: Draws(seed),
+            home: scope.wrapping_add(0x0203),
             now: Duration::ZERO,
             tickets: Vec::new(),
             seen: BTreeSet::new(),
@@ -132,7 +146,7 @@ impl Run {
             } else {
                 self.draws.below(10)
             };
-            let held = 1 + self.draws.below(5);
+            let held = scoped(self.home, 1 + self.draws.below(5));
             let got = self.core.start(p, s, t, base, token(held), now);
             assert_eq!(got, self.model.start(p, s, t, base, held, now));
             self.record(got.map(|_| Acked::Recorded(Phase::Quiesce)), &before);
@@ -188,6 +202,10 @@ impl Run {
         };
         let choice = if self.draws.chance(5) { 7 } else { choice };
         let (core, model, d) = (&mut self.core, &mut self.model, &mut self.draws);
+        let home = self.home;
+        let granted = entry.as_ref().and_then(|m| m.granted);
+        let granted = granted.map(|raw| sequence_of(raw) - 1);
+        let mut offered = None;
         let near = |d: &mut Draws, value: Option<u64>| match value {
             Some(value) if d.chance(92) => value,
             _ => d.below(9),
@@ -248,15 +266,17 @@ impl Run {
                 )
             }
             5 => {
-                let grant = 1 + near(d, entry.as_ref().and_then(|m| m.granted).map(|g| g - 1));
+                let grant = fencing(1 + near(d, granted), home, d);
+                offered = Some(grant);
                 (
                     core.fenced(ticket, token(grant), now),
                     model.fenced(ticket, grant, now),
                 )
             }
             6 => {
-                let grant = 1 + near(d, entry.as_ref().and_then(|m| m.granted).map(|g| g - 1));
+                let grant = fencing(1 + near(d, granted), home, d);
                 let who = by(d, target);
+                offered = Some(grant);
                 (
                     core.activated(ticket, who, token(grant), now),
                     model.activated(ticket, who, grant, now),
@@ -265,8 +285,9 @@ impl Run {
             7 => {
                 let fence = match undo {
                     Some(_) if d.chance(60) => undo,
-                    _ => d.chance(50).then(|| 1 + d.below(12)),
+                    _ => d.chance(50).then(|| fencing(1 + d.below(12), home, d)),
                 };
+                offered = fence;
                 (
                     core.abort(ticket, fence.map(token), now),
                     model.abort(ticket, fence, now),
@@ -291,6 +312,12 @@ impl Run {
             got, expected,
             "choice {choice} on {ticket:?} waiting for {wait:?}"
         );
+        if entry.is_some() && got == Err(Refusal::Unknown) {
+            // The ticket is live, so only a token of another scope is unknown.
+            assert!(offered.is_some_and(|raw| scope_of(raw) != home));
+            self.seen
+                .insert(format!("foreign token at {}", ACKS[choice.min(9) as usize]));
+        }
         if got.is_ok_and(Acked::is_duplicate) {
             self.seen
                 .insert(format!("repeat of {}", ACKS[choice.min(9) as usize]));
@@ -387,6 +414,9 @@ fn core_matches_the_naive_model_under_random_operations() {
         "Err(FenceRequired)",
         "foreign ticket",
         "foreign ticket at a live transfer",
+        "foreign token at fenced",
+        "foreign token at activated",
+        "foreign token at abort",
     ];
     assert!(!seen.contains("repeat of activated"), "it frees the slot");
     for outcome in expected {

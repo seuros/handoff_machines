@@ -2,7 +2,7 @@
 mod init;
 mod names;
 
-use std::{cell::RefCell, time::Duration};
+use std::{cell::RefCell, cmp::Ordering, time::Duration};
 
 use handoff_machines::{Acked, FencingToken, Limits, Refusal, Ticket};
 use magnus::{
@@ -37,9 +37,15 @@ impl Number {
         Duration::from_nanos(self.0)
     }
 
+    /// A fencing token from its raw value: `FencingToken::from_raw`, or the
+    /// `RangeError` its `None` stands for.
     fn token(self, ruby: &Ruby) -> Result<FencingToken, Error> {
-        FencingToken::new(self.0)
-            .ok_or_else(|| Error::new(ruby.exception_range_error(), "fencing tokens are positive"))
+        FencingToken::from_raw(self.0).ok_or_else(|| {
+            Error::new(
+                ruby.exception_range_error(),
+                "a fencing token has a positive sequence number",
+            )
+        })
     }
 
     fn index(self, ruby: &Ruby) -> Result<usize, Error> {
@@ -70,6 +76,26 @@ impl TryConvert for Scope {
 /// The scope a ticket's generation carries: `Ticket#scope`.
 const fn scope_of(generation: Number) -> u16 {
     ticket(Number(0), generation).scope()
+}
+
+/// `FencingToken#scope`; converting the token is what validates it.
+fn token_scope(ruby: &Ruby, token: Number) -> Result<u16, Error> {
+    Ok(token.token(ruby)?.scope())
+}
+
+/// `FencingToken#order`: -1, 0, 1, or `nil` across scopes.
+fn token_order(ruby: &Ruby, token: Number, other: Number) -> Result<Option<i8>, Error> {
+    let order = token.token(ruby)?.order(other.token(ruby)?);
+    Ok(order.map(|order| match order {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }))
+}
+
+/// `FencingToken#newer_than?`.
+fn token_newer(ruby: &Ruby, token: Number, other: Number) -> Result<bool, Error> {
+    Ok(token.token(ruby)?.is_newer_than(other.token(ruby)?))
 }
 
 const fn ticket(partition: Number, generation: Number) -> Ticket {
@@ -321,7 +347,7 @@ impl Handoff {
             status.base,
             status.until,
             status.checkpoint,
-            status.token.map(FencingToken::value),
+            status.token.map(FencingToken::raw),
             status.deadline.as_nanos(),
         );
         Some((head, tail).into_value_with(ruby))

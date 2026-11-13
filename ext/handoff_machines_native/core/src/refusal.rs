@@ -20,8 +20,12 @@ pub enum Refusal {
     ClockRegressed,
     /// The ticket's generation was issued but is not the partition's current transfer.
     Stale,
-    /// The ticket was never issued by this coordinator: its generation is
-    /// zero, beyond the last one issued, or of another scope.
+    /// An id that is not of the namespace the call ranks it in. The ticket
+    /// was never issued by this coordinator: its generation is zero, beyond
+    /// the last one issued, or of another scope. Or the fencing token offered
+    /// to `fenced`, `activated` or `abort` is of another scope than the
+    /// transfer's source token: it names nothing in this transfer, and is
+    /// answered before the transfer's phase or recorded token is read.
     Unknown,
     /// The transfer is not waiting for this acknowledgement and never
     /// recorded it: it came too early, or the transfer left the path that
@@ -40,7 +44,9 @@ pub enum Refusal {
     /// The quiesce point, checkpoint or token is not the one this transfer
     /// recorded: a first report that contradicts it, or a repeat that differs.
     Mismatch,
-    /// The token does not exceed every token this transfer already knows.
+    /// The token is of the transfer's token scope and does not exceed every
+    /// token this transfer already knows. A token of another scope is
+    /// `Unknown`, never this.
     StaleToken,
     /// Activation was ordered; aborting needs a newer fencing token.
     FenceRequired,
@@ -56,7 +62,9 @@ impl fmt::Display for Refusal {
             Self::Exhausted => "generation space exhausted",
             Self::ClockRegressed => "time is earlier than the latest accepted observation",
             Self::Stale => "the ticket is not the partition's current transfer",
-            Self::Unknown => "the ticket was never issued by this coordinator",
+            Self::Unknown => {
+                "the ticket was never issued by this coordinator, or the token is of another scope"
+            }
             Self::OutOfPhase => {
                 "the transfer neither waits for this acknowledgement nor recorded it"
             }

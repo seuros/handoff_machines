@@ -77,7 +77,8 @@ pub fn acked(ruby: &Ruby, outcome: Result<Acked, Refusal>) -> Value {
     }
 }
 
-/// Recipient (replica Integer or `:authority`), action name and its field;
+/// Recipient (replica Integer or `:authority`), action name and its field
+/// (a token as its raw Integer);
 /// the Ruby side wraps them as `Replica` and the action `Data` values.
 pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
     let to = match order.to {
@@ -89,9 +90,9 @@ pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
         Action::Drain { until } => ("drain", Some(until)),
         Action::Capture { at } => ("capture", Some(at)),
         Action::Install { checkpoint } => ("install", Some(checkpoint)),
-        Action::Fence { above } => ("fence", Some(above.value())),
-        Action::Activate { token } => ("activate", Some(token.value())),
-        Action::Resume { token } => ("resume", token.map(FencingToken::value)),
+        Action::Fence { above } => ("fence", Some(above.raw())),
+        Action::Activate { token } => ("activate", Some(token.raw())),
+        Action::Resume { token } => ("resume", token.map(FencingToken::raw)),
         Action::Discard => ("discard", None),
     };
     (to, ruby.to_symbol(name), value)

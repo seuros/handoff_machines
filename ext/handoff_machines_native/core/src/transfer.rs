@@ -1,4 +1,4 @@
-use core::time::Duration;
+use core::{cmp::Ordering, time::Duration};
 
 use lease_machines::FencingToken;
 use offset_machines::{Ack, Commit, Tracker};
@@ -56,6 +56,22 @@ pub struct Transfer<const WORDS: usize> {
     token: Option<FencingToken>,
     installed: bool,
     tracker: Tracker<WORDS>,
+}
+
+/// Whether `token` may supersede `floor`, the newest token the transfer knows.
+///
+/// Tokens of two scopes have no order, so "not newer" is two different
+/// answers: a token of the floor's scope that does not exceed it is
+/// `StaleToken`, and a token of another scope is `Unknown`, the name every
+/// crate gives an id that is not of the namespace the call ranks in. Neither
+/// is ever folded into the other. Every caller has passed [`Transfer::homed`]
+/// first, so the `Unknown` arm is the same answer given again, never a new one.
+const fn supersedes(token: FencingToken, floor: FencingToken) -> Result<(), Refusal> {
+    match token.order(floor) {
+        Some(Ordering::Greater) => Ok(()),
+        Some(Ordering::Less | Ordering::Equal) => Err(Refusal::StaleToken),
+        None => Err(Refusal::Unknown),
+    }
 }
 
 /// Answer to an acknowledgement the transfer already recorded: an idempotent
@@ -180,6 +196,18 @@ impl<const WORDS: usize> Transfer<WORDS> {
         (self.step == Step::Drain).then_some((&self.tracker, until))
     }
 
+    /// A token of another scope than the source token's names nothing in
+    /// this transfer: `Unknown`, answered before the step or any recorded
+    /// token is read. Every token the transfer records has passed this, so
+    /// the source token's scope is the transfer's one token scope.
+    const fn homed(&self, token: FencingToken) -> Result<(), Refusal> {
+        if token.scope() == self.source_token.scope() {
+            Ok(())
+        } else {
+            Err(Refusal::Unknown)
+        }
+    }
+
     fn expect(&self, step: Step, replica: u64, holder: u64) -> Result<(), Refusal> {
         if self.step != step {
             Err(Refusal::OutOfPhase)
@@ -285,21 +313,21 @@ impl<const WORDS: usize> Transfer<WORDS> {
     }
 
     pub fn fenced(&mut self, token: FencingToken) -> Result<Next, Refusal> {
+        self.homed(token)?;
         if let Some(recorded) = self.token {
             return replay(true, recorded == token);
         }
         if self.step != Step::Fence {
             return Err(Refusal::OutOfPhase);
         }
-        if token <= self.source_token {
-            return Err(Refusal::StaleToken);
-        }
+        supersedes(token, self.source_token)?;
         self.token = Some(token);
         self.step = Step::Activate;
         Ok(Next::Moved)
     }
 
     pub fn activated(&self, replica: u64, token: FencingToken) -> Result<Next, Refusal> {
+        self.homed(token)?;
         self.expect(Step::Activate, replica, self.target)?;
         if self.token != Some(token) {
             return Err(Refusal::Mismatch);
@@ -308,6 +336,9 @@ impl<const WORDS: usize> Transfer<WORDS> {
     }
 
     pub fn abort(&mut self, token: Option<FencingToken>) -> Result<Next, Refusal> {
+        if let Some(token) = token {
+            self.homed(token)?;
+        }
         let discard = match self.step {
             Step::Rollback {
                 token: recorded, ..
@@ -315,9 +346,11 @@ impl<const WORDS: usize> Transfer<WORDS> {
             Step::Quiesce | Step::Drain | Step::Capture => false,
             Step::Install | Step::Fence | Step::Activate => true,
         };
+        // The activation token is of the source token's scope: `fenced`
+        // admitted it. So the floor always names the transfer's one scope.
         let floor = self.token.unwrap_or(self.source_token);
-        if token.is_some_and(|token| token <= floor) {
-            return Err(Refusal::StaleToken);
+        if let Some(token) = token {
+            supersedes(token, floor)?;
         }
         if token.is_none() && self.step == Step::Activate {
             return Err(Refusal::FenceRequired);

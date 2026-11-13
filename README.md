@@ -14,8 +14,11 @@ gem 'handoff_machines'
 limits = HandoffMachines::Limits.new(30_000_000_000, 2)   # phase_budget, per_replica
 handoff = HandoffMachines::Handoff.new(limits)
 
+# Fencing tokens are values your lease authority issues. The source serves under `held`.
+held = HandoffMachines::FencingToken.from_raw(7)
+
 # partition, source, target, base, source_token, now
-ticket = handoff.start(42, 1, 2, 100, 7, clock.now)
+ticket = handoff.start(42, 1, 2, 100, held, clock.now)
 raise "refused: #{ticket}" if ticket.is_a?(Symbol)
 
 orders, = handoff.orders(0, 32)
@@ -27,11 +30,12 @@ handoff.drained(ticket, 1, 100, clock.now)     # => Recorded(:drain)
 handoff.drained(ticket, 1, 101, clock.now)     # => Recorded(:checkpoint)
 handoff.captured(ticket, 1, 9, clock.now)      # => Recorded(:checkpoint)
 handoff.installed(ticket, 2, 9, clock.now)     # => Recorded(:activate)
-handoff.fenced(ticket, 8, clock.now)           # => Recorded(:activate)
-handoff.activated(ticket, 2, 8, clock.now)     # => Recorded(:complete)
+granted = HandoffMachines::FencingToken.from_raw(8)   # the authority's answer to the Fence order
+handoff.fenced(ticket, granted, clock.now)       # => Recorded(:activate)
+handoff.activated(ticket, 2, granted, clock.now) # => Recorded(:complete)
 ```
 
-One coordinator, one method per acknowledgement. The Ruby API is the core's, name for name: `HandoffMachines::Handoff` is the core's `Handoff`, every `Data` value has the fields of the core struct or enum variant it mirrors, and arguments come in the core's order. Partitions, replicas, offsets, checkpoints and tokens are Integers. Time is Integer nanoseconds on one monotonic clock, `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`, for instants (`now`, `deadline`) and spans (`phase_budget`) alike. No floats, no milliseconds, no `Time.now`.
+One coordinator, one method per acknowledgement. The Ruby API is the core's, name for name: `HandoffMachines::Handoff` is the core's `Handoff`, every `Data` value has the fields of the core struct or enum variant it mirrors, and arguments come in the core's order. Partitions, replicas, offsets and checkpoints are Integers; fencing tokens are `FencingToken` values. Time is Integer nanoseconds on one monotonic clock, `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`, for instants (`now`, `deadline`) and spans (`phase_budget`) alike. No floats, no milliseconds, no `Time.now`.
 
 This is an initial release with an unstable API. It is a policy core, not a runtime: it sends nothing, stores nothing and issues no tokens.
 
@@ -122,11 +126,12 @@ limits = HandoffMachines::Limits.new(30_000_000_000, 2)
 handoff = HandoffMachines::Handoff.new(limits)
 handoff.limits   # => #<data HandoffMachines::Limits phase_budget=30000000000, per_replica=2>
 
-ticket = handoff.start(42, 1, 2, 100, 7, 0)
+held = HandoffMachines::FencingToken.from_raw(7)
+ticket = handoff.start(42, 1, 2, 100, held, 0)
 ticket   # => #<data HandoffMachines::Ticket partition=42, generation=1>
 ```
 
-`Limits` is `phase_budget` (how long one phase may last before `overdue` reports it) and `per_replica` (how many transfers one replica may take part in). `start(partition, source, target, base, source_token, now)` takes the core's arguments in the core's order: `base` is the lowest offset the source has not durably committed, and `source_token` is the fencing token the source serves under today. The `Ticket` carries a generation that is never issued twice. Send it along with every order and have the replica send it back.
+`Limits` is `phase_budget` (how long one phase may last before `overdue` reports it) and `per_replica` (how many transfers one replica may take part in). `start(partition, source, target, base, source_token, now)` takes the core's arguments in the core's order: `base` is the lowest offset the source has not durably committed, and `source_token` is the fencing token the source serves under today; its scope is the transfer's token scope. The `Ticket` carries a generation that is never issued twice. Send it along with every order and have the replica send it back.
 
 ### Orders
 
@@ -217,12 +222,27 @@ The source captures state at exactly the quiesce point and names it. The target 
 ### Activate
 
 ```ruby
-handoff.orders(0, 32).first.first    # => Order(to: :authority, action: Fence(above: 7))
-handoff.fenced(ticket, 8, 6)         # => Recorded(:activate)
-handoff.activated(ticket, 2, 8, 7)   # => Recorded(:complete)
+handoff.orders(0, 32).first.first          # => Order(to: :authority, action: Fence(above: FencingToken(raw: 7)))
+granted = HandoffMachines::FencingToken.from_raw(8)
+handoff.fenced(ticket, granted, 6)         # => Recorded(:activate)
+handoff.activated(ticket, 2, granted, 7)   # => Recorded(:complete)
 ```
 
-First the authority issues the target a token strictly greater than the source's. A token that isn't greater is `:stale_token`. Then the target acknowledges it is serving under that exact token. `Recorded(:complete)` frees the slot.
+First the authority issues the target a token strictly newer than the source's. A token of the source token's scope that isn't newer is `:stale_token`. Then the target acknowledges it is serving under that exact token. `Recorded(:complete)` frees the slot.
+
+### Fencing tokens
+
+A `FencingToken` is the lease core's token, which the handoff core re-exports: plain data whose `raw` is the issuing authority's scope in the top 16 bits above a sequence number counted from 1. The coordinator issues none. Every method that takes a token (`start`, `fenced`, `activated`, `abort`) reads its `raw`, so a `LeaseMachines::FencingToken` fits as it is: pass `lease.token`, not `lease.token.raw`. This gem does not depend on that one. A bare Integer is not a token and raises `TypeError`; rebuild one that crossed a wire with `HandoffMachines::FencingToken.from_raw(raw)`. Tokens come back as `HandoffMachines::FencingToken` in `Fence#above`, `Activate#token`, `Resume#token` and `Status#token`.
+
+Tokens of one scope are ordered. Tokens of two scopes are not: there is no `<`, `order` answers `nil` and `newer_than?` answers `false`. So a transfer reads tokens only inside its source token's scope, and a token of any other scope is `:unknown`, whatever its number, from every call that takes one: `fenced`, `activated` and `abort`. That is the fleet's name for an id that is not of the namespace the call reads it in. It is answered before the transfer's phase or its recorded token is looked at, so it is never folded into "older" (`:stale_token`), "not the one recorded" (`:mismatch`) or "not now" (`:out_of_phase`). While the transfer still waits for the authority's token:
+
+```ruby
+other = HandoffMachines::FencingToken.from_raw((3 << 48) | 8)   # scope 3, the source token is scope 0
+handoff.fenced(ticket, other, 6)   # => :unknown, nothing changed
+handoff.fenced(ticket, held, 6)    # => :stale_token, right scope, not newer
+```
+
+One transfer therefore lives under one authority scope. If your authority came back under a new scope before `fenced`, give the transfer up with `abort(ticket, nil, now)` and start it again under a source token of the new scope.
 
 ### Abort
 
@@ -243,10 +263,11 @@ After `fenced`, activation has been ordered and the target may already be servin
 
 ```ruby
 handoff.abort(ticket, nil, 8)   # => :fence_required
-handoff.abort(ticket, 9, 8)     # => Recorded(:rollback), source resumes under token 9
+newer = HandoffMachines::FencingToken.from_raw(9)
+handoff.abort(ticket, newer, 8)   # => Recorded(:rollback), source resumes under token 9
 ```
 
-The rollback token must beat the activation token, so the target is fenced out the same way the source would have been.
+The rollback token must be of the same scope and beat the activation token, so the target is fenced out the same way the source would have been. One of another scope is `:unknown`, whatever else is wrong with the call; one of the right scope that doesn't beat it is `:stale_token`.
 
 ### Stale tickets
 
@@ -293,7 +314,7 @@ That's all it does about it. A late acknowledgement is still accepted, and nothi
 
 A call that is honoured answers with a value. A call that is not honoured answers with one of the refusal symbols below, and only those, and changes nothing. Each refusal is the snake_case of one core `Refusal` variant; there is no catch-all symbol. `Duplicate(phase)` is an honoured repeat: the transfer already recorded that acknowledgement with that payload, and nothing changed.
 
-Every acknowledgement can also refuse with `:clock_regressed`, `:stale` or `:unknown` (the *ticket refusals*). `:out_of_phase` always means "not awaited and never recorded": too early, or the transfer was given up first. `:mismatch` means the payload is not the recorded one. `activated`, and the `resumed` or `discarded` that ends a rollback, free the slot: their repeats are `:stale`.
+Every acknowledgement can also refuse with `:clock_regressed`, `:stale` or `:unknown` (the *ticket refusals*). From `fenced`, `activated` and `abort`, `:unknown` can also be a fencing token of another scope than the transfer's source token. Refusals are listed in the order they are checked, and the first that applies is the answer: the ticket refusals first (`:clock_regressed`, then `:unknown` or `:stale` for the ticket), then the rest left to right. `:out_of_phase` always means "not awaited and never recorded": too early, or the transfer was given up first. `:mismatch` means the payload is not the recorded one. `activated`, and the `resumed` or `discarded` that ends a rollback, free the slot: their repeats are `:stale`.
 
 | Call | Honoured | Refusals |
 | --- | --- | --- |
@@ -303,9 +324,9 @@ Every acknowledgement can also refuse with `:clock_regressed`, `:stale` or `:unk
 | `committed(ticket, replica, offset, now)` | `Recorded(:drain)`, `Duplicate` (offset already committed) | ticket refusals, `:out_of_phase`, `:wrong_replica`, `:unacked` |
 | `captured(ticket, replica, checkpoint, now)` | `Recorded(:checkpoint)`, `Duplicate` (same checkpoint again) | ticket refusals, `:out_of_phase`, `:wrong_replica`, `:mismatch` (different checkpoint) |
 | `installed(ticket, replica, checkpoint, now)` | `Recorded(:activate)`, `Duplicate` (same checkpoint again) | ticket refusals, `:out_of_phase`, `:wrong_replica`, `:mismatch` (not the captured checkpoint) |
-| `fenced(ticket, token, now)` | `Recorded(:activate)`, `Duplicate` (same token again) | ticket refusals, `:out_of_phase`, `:stale_token`, `:mismatch` (different token) |
-| `activated(ticket, replica, token, now)` | `Recorded(:complete)` | ticket refusals, `:out_of_phase`, `:wrong_replica`, `:mismatch` (not the fenced token) |
-| `abort(ticket, token, now)` | `Recorded(:rollback)`, `Duplicate` (rollback under way, same `token`) | ticket refusals, `:stale_token`, `:fence_required`, `:mismatch` (rollback under way, different `token`) |
+| `fenced(ticket, token, now)` | `Recorded(:activate)`, `Duplicate` (same token again) | ticket refusals, `:unknown` (token of another scope), `:mismatch` (a different token is recorded), `:out_of_phase`, `:stale_token` (not newer than the source token) |
+| `activated(ticket, replica, token, now)` | `Recorded(:complete)` | ticket refusals, `:unknown` (token of another scope), `:out_of_phase`, `:wrong_replica`, `:mismatch` (not the fenced token) |
+| `abort(ticket, token, now)` | `Recorded(:rollback)`, `Duplicate` (rollback under way, same `token`) | ticket refusals, `:unknown` (token of another scope), `:mismatch` (rollback under way, different `token`), `:stale_token` (not newer than every token known), `:fence_required` |
 | `resumed(ticket, replica, now)` | `Recorded(:rollback)`, `Recorded(:aborted)`, `Duplicate` (already recorded) | ticket refusals, `:out_of_phase`, `:wrong_replica` |
 | `discarded(ticket, replica, now)` | `Recorded(:rollback)`, `Recorded(:aborted)`, `Duplicate` (already recorded or never owed) | ticket refusals, `:out_of_phase`, `:wrong_replica` |
 | `outstanding(ticket, from, limit)` | `Array` of offsets | `:stale`, `:unknown`, `:out_of_phase` |
@@ -316,7 +337,8 @@ A `Duplicate` carries the phase the transfer stands at now: any phase from the o
 
 ## The Rules of the Tender
 
-- **Everything is an Integer** in `0..2**64-1`. Fencing tokens start at 1. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`.
+- **Ids are Integers** in `0..2**64-1`: partitions, replicas, offsets, checkpoints. Floats, nil, and strings raise `TypeError`. Out of range raises `RangeError`.
+- **Fencing tokens are values.** Anything with a `raw` reader is a token, the `lease_machines` gem's included; a bare Integer raises `TypeError`, and a `raw` whose sequence number is zero raises `RangeError`.
 - **Time is Integer nanoseconds.** `now`, `Limits#phase_budget` and `Status#deadline` are nanoseconds on one monotonic clock. A Float or any other non-Integer raises `TypeError`; a negative value or one past `2**64-1` raises `RangeError`. `deadline` is `now + phase_budget` exactly, so it can read back larger than `2**64-1`.
 - **Values mirror the core.** `Limits`, `Ticket`, `Order` and `Status` have the core struct's fields in the core's order. An enum variant with a field is a `Data` named after it (`Recorded`, `Duplicate`, `Replica`, `Drain`, `Capture`, `Install`, `Fence`, `Activate`, `Resume`); one without is a Symbol (`:authority`, `:quiesce`, `:discard`, every phase). No argument has a default the core lacks: `orders`, `outstanding` and `overdue` take `from` and `limit` every time, and `limit` is the one argument the core does not have, because Ruby gets an Array where the core hands out an iterator.
 - **Tickets are plain data.** A `Ticket` is a `Data` with a partition and a generation, so it survives a trip over the wire. Anything that isn't a `Ticket` raises `TypeError`, and so does a constructor given anything but a `Limits`.

@@ -125,6 +125,8 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     ///
     /// `base` is the lowest offset not yet durably committed under the source,
     /// and `source_token` the fencing token the source currently serves under.
+    /// Its scope is the transfer's token scope: every later token is ranked
+    /// against it, and one of another scope is [`Refusal::Unknown`].
     ///
     /// # Errors
     /// `ClockRegressed`, `SameReplica`, `Busy`, `Full`, `ReplicaBusy` or `Exhausted`.
@@ -271,16 +273,19 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         })
     }
 
-    /// The authority issued the target `token`, which must exceed the
-    /// source's token. From here on, aborting needs a newer token still.
+    /// The authority issued the target `token`, which must be of the source
+    /// token's scope and exceed it. From here on, aborting needs a newer
+    /// token still.
     ///
     /// Repeated with the recorded token it is an idempotent repeat:
     /// [`Acked::Duplicate`].
     ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase` (no token is awaited yet, or the
-    /// transfer was given up before one arrived), `StaleToken`, or `Mismatch`
-    /// when a different token is already recorded.
+    /// In this order: a ticket refusal; `Unknown` (a token of another scope
+    /// than the source token's, whatever the transfer waits for or has
+    /// recorded); `Mismatch` when a different token is already recorded;
+    /// `OutOfPhase` (no token is awaited yet, or the transfer was given up
+    /// before one arrived); `StaleToken` (not above the source token).
     pub fn fenced(
         &mut self,
         ticket: Ticket,
@@ -296,8 +301,10 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// ticket and is refused as `Stale`; this call never answers a duplicate.
     ///
     /// # Errors
-    /// A ticket refusal, `OutOfPhase` (activation is not ordered, or the
-    /// transfer was given up), `WrongReplica` or `Mismatch`.
+    /// In this order: a ticket refusal; `Unknown` (a token of another scope
+    /// than the source token's); `OutOfPhase` (activation is not ordered, or
+    /// the transfer was given up); `WrongReplica`; `Mismatch` (not the token
+    /// recorded by `fenced`).
     pub fn activated(
         &mut self,
         ticket: Ticket,
@@ -310,16 +317,18 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
 
     /// Give the transfer up from any phase and move to `Rollback`.
     ///
-    /// A `token` fences the rollback: it must exceed every token the transfer
-    /// knows, and the source resumes under it. It is required once activation
-    /// was ordered, because the target may already be serving.
+    /// A `token` fences the rollback: it must be of the source token's scope
+    /// and exceed every token the transfer knows, and the source resumes
+    /// under it. It is required once activation was ordered, because the
+    /// target may already be serving.
     ///
     /// During the rollback, repeated with the same `token` (or the same
     /// absence of one), it is an idempotent repeat: [`Acked::Duplicate`].
     ///
     /// # Errors
-    /// A ticket refusal, `StaleToken`, `FenceRequired`, or `Mismatch` when the
-    /// rollback is already under way with a different token.
+    /// In this order: a ticket refusal; `Unknown` (a token of another scope
+    /// than the source token's); `Mismatch` when the rollback is already
+    /// under way with a different token; `StaleToken`; `FenceRequired`.
     pub fn abort(
         &mut self,
         ticket: Ticket,

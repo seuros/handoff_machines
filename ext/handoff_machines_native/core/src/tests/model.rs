@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, vec::Vec};
 
 use crate::{Acked, Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
 
-use periscope_machines::sequence_of;
+use periscope_machines::{scope_of, sequence_of};
 
 use super::token;
 
@@ -281,6 +281,7 @@ impl Model {
 
     pub fn fenced(&mut self, ticket: Ticket, granted: u64, now: Duration) -> Outcome {
         self.on(ticket, now, |m, _| {
+            homed(granted, m.held)?;
             if let Some(recorded) = m.granted {
                 return replay(true, recorded == granted);
             }
@@ -300,6 +301,7 @@ impl Model {
         now: Duration,
     ) -> Outcome {
         self.on(ticket, now, |m, _| {
+            homed(granted, m.held)?;
             check(m.wait == Wait::Activate, Refusal::OutOfPhase)?;
             check(replica == m.target, Refusal::WrongReplica)?;
             check(m.granted == Some(granted), Refusal::Mismatch)?;
@@ -309,11 +311,12 @@ impl Model {
 
     pub fn abort(&mut self, ticket: Ticket, fence: Option<u64>, now: Duration) -> Outcome {
         self.on(ticket, now, |m, _| {
+            fence.map_or(Ok(()), |fence| homed(fence, m.held))?;
             if m.wait == Wait::Undo {
                 return replay(true, m.undo_token == fence);
             }
             let known = m.granted.unwrap_or(m.held);
-            check(fence.is_none_or(|f| f > known), Refusal::StaleToken)?;
+            check(fence.is_none_or(|fence| fence > known), Refusal::StaleToken)?;
             check(
                 fence.is_some() || m.wait != Wait::Activate,
                 Refusal::FenceRequired,
@@ -426,4 +429,11 @@ fn replay(holder: bool, same: bool) -> Result<End, Refusal> {
 
 fn check(holds: bool, refusal: Refusal) -> Result<(), Refusal> {
     if holds { Ok(()) } else { Err(refusal) }
+}
+
+/// A raw token means something to a transfer only inside the scope of the
+/// token its source `held`: numbers of two scopes are never ranked against
+/// each other, nor compared with what the transfer recorded.
+fn homed(token: u64, held: u64) -> Result<(), Refusal> {
+    check(scope_of(token) == scope_of(held), Refusal::Unknown)
 }

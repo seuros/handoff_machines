@@ -1,5 +1,5 @@
 //! Private native entry point.
-use crate::{CAPACITY, Core, Handoff, names, scope_of};
+use crate::{CAPACITY, Core, Handoff, names, scope_of, token_newer, token_order, token_scope};
 use magnus::{Error, Ruby, function, method, prelude::*};
 
 #[magnus::init]
@@ -14,6 +14,9 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     };
     module.const_set("PHASES", symbols(&names::PHASES))?;
     module.const_set("REFUSALS", symbols(&names::REFUSALS))?;
+    module.define_singleton_method("native_token_scope", function!(token_scope, 1))?;
+    module.define_singleton_method("native_token_order", function!(token_order, 2))?;
+    module.define_singleton_method("native_token_newer", function!(token_newer, 2))?;
     let class = module.define_class("Handoff", ruby.class_object())?;
     class.undef_default_alloc_func();
     class.define_singleton_method("native_with_scope", function!(Handoff::with_scope, 3))?;
