@@ -10,7 +10,7 @@
 //! was read is then rebuilt through the core constructor, which `Marshal.load`
 //! skipped.
 use magnus::{Error, RClass, RModule, Ruby, Value, prelude::*};
-use matryona_machines::ruby::{Class, Registry, exact_fields, instance_of};
+use matryona_machines::ruby::{Class, Registry, exact_fields_with, instance_of};
 
 /// Every `Data` class the binding checks or builds.
 pub struct Classes {
@@ -82,7 +82,7 @@ pub fn fields<const N: usize>(
 ) -> Result<[Value; N], Error> {
     let class: RClass = class.get(ruby);
     if instance_of(value, class) {
-        return exact_fields::<N>(ruby, value, class, format!("expected a {class}"));
+        return exact_fields_with::<N>(ruby, value, class, || format!("expected a {class}"));
     }
     if value.is_kind_of(class) {
         return Err(type_error(

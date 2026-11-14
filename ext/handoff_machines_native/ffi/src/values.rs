@@ -7,9 +7,9 @@ use handoff_machines::{
     Acked, Action, FencingToken, Limits, Order, Phase, Recipient, Status, Ticket,
 };
 use magnus::{Error, Ruby, Symbol, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, duration, instance_of, instant, integer, optional};
+use matryona_machines::ruby::{Symbols, duration, exact_fields, instant, integer, optional, which};
 
-use crate::classes::{ACTIONS, Origin, classes, fields};
+use crate::classes::{Origin, classes, fields};
 use crate::{names::Phases, raw_token};
 
 fn range(ruby: &Ruby, message: &'static str) -> Error {
@@ -136,16 +136,11 @@ fn action(ruby: &Ruby, value: Value) -> Result<Action, Error> {
             )),
         };
     }
-    let classes = classes(ruby)?;
-    let index = (0..ACTIONS.len())
-        .find(|&index| instance_of(value, classes.actions[index].get(ruby)))
-        .ok_or_else(|| {
-            Error::new(
-                ruby.exception_type_error(),
-                "an action is an action Data (exactly its class) or a Symbol",
-            )
-        })?;
-    let [field] = fields(ruby, value, classes.actions[index], ["field"], Origin::Own)?;
+    let message = "an action is an action Data (exactly its class) or a Symbol";
+    let actions = classes(ruby)?.actions.map(|class| class.get(ruby));
+    let index =
+        which(value, &actions).ok_or_else(|| Error::new(ruby.exception_type_error(), message))?;
+    let [field] = exact_fields::<1>(ruby, value, actions[index], message)?;
     Ok(match index {
         0 => Action::Drain {
             until: integer(field, "until")?,
