@@ -13,7 +13,7 @@ offsets, and refuses rather than grows.
 It coordinates ownership migration. It does not rank placement, replicate data,
 issue fencing tokens, send messages or persist anything.
 
-- `start` issues a `Ticket { partition, generation }`. Generations are strictly
+- `start` issues a `Ticket` (`partition()`, `generation()`). Generations are strictly
   increasing and never reused. Every acknowledgement carries its ticket: an
   issued generation that is no longer the partition's transfer is `Stale`, one
   never issued is `Unknown`.
@@ -78,9 +78,40 @@ issue fencing tokens, send messages or persist anything.
 - `orders(from)` restates what is owed, at most two orders per transfer. Orders
   are derived from state, not queued: nothing overflows, and a pass can stop
   anywhere and resume from `Orders::position()`.
-- Every mutating call takes `now`. An earlier `now` than the last accepted one is
+- Every mutating call takes `now`. An earlier `now` than the last recorded one is
   `ClockRegressed`. Each phase gets `Limits::phase_budget`; `overdue` lists
   transfers past it. That is advice: the coordinator never aborts by itself.
+- **Which answers record the clock.** An honoured call records `now` exactly
+  when its answer depends on it: `start`, and every acknowledgement that moves
+  the transfer to a new wait (`quiesced`, a `drained` that ends the drain,
+  `captured`, `installed`, `fenced`, `abort`), because the new phase's
+  deadline is `now + phase_budget`. A `Duplicate`, a `drained` or
+  `committed` within the drain, a `resumed` or `discarded` while the rollback
+  still waits for the other, and the acknowledgement that ends the transfer
+  (`activated`, the last of the rollback) hold whatever the time and record
+  nothing. `overdue(now, ..)` is a query.
+- **Values valid by construction.** `Limits::new` (`None` for `per_replica`
+  zero), `Ticket::new` (`None` for a zero sequence), `Acked::recorded` and
+  `Acked::duplicate` (`None` for a phase no acknowledgement answers),
+  `Order::new` (`None` unless only the authority is asked to fence, and it
+  is asked nothing else) and `Status::new` (`None` for a view no live
+  transfer reports) are what the Ruby binding builds every value through.
+  Their fields are private: a `Ticket`, `Order`, `Status` or `Limits` exists
+  only as its constructor or the coordinator built it, and is read through
+  accessors named after the fields.
+  `Phase::is_final` says whether a phase ends a transfer.
+- **No unreachable arms.** Each step carries what its order restates, so an
+  order is never missing a field. Tokens reach `supersedes` only after their
+  scope was checked, so it compares raw values. Two arms remain that the
+  types demand and the invariants rule out, each a `debug_assert!` with the
+  most conservative refusal and nothing changed: a fresh drain tracker
+  refusing the transfer's issued generation (`start` answers `Exhausted`;
+  the generation is issued on a copy and kept only once the transfer
+  exists), and the drain tracker refusing an `ack` or a `mark_committed`
+  for a reason the transfer rules out, such as `Stale` under the ticket's own
+  generation (`OutOfPhase`). `restored` returns `None` under a
+  `debug_assert!` if a sequence taken out of an id were past the last.
+  Nothing in the crate panics.
 - Every call that can refuse returns `Result<T, Refusal>`. `Refusal` is the one
   enum for "not honoured", and a refused call changes nothing. No public enum
   is `#[non_exhaustive]`: a new variant is a breaking change every caller
@@ -121,14 +152,14 @@ use core::time::Duration;
 use handoff_machines::{Acked, Action, FencingToken, Handoff, Limits, Phase, Recipient, Refusal};
 
 # fn example() -> Option<()> {
-let limits = Limits { phase_budget: Duration::from_secs(30), per_replica: 2 };
+let limits = Limits::new(Duration::from_secs(30), 2)?;
 let mut handoff = Handoff::<8, 4>::new(limits); // 8 transfers, 256-offset drains
 let now = Duration::ZERO;
 let held = FencingToken::from_raw(7)?; // scope zero, sequence 7
 // Partition 42 from replica 1 to replica 2; offsets below 100 are committed.
 let ticket = handoff.start(42, 1, 2, 100, held, now).ok()?;
 let order = handoff.orders(0).next()?;
-assert_eq!((order.to, order.action), (Recipient::Replica(1), Action::Quiesce));
+assert_eq!((order.to(), order.action()), (Recipient::Replica(1), Action::Quiesce));
 
 let acked = |phase| Ok(Acked::Recorded(phase));
 assert_eq!(handoff.quiesced(ticket, 1, 102, now), acked(Phase::Drain));

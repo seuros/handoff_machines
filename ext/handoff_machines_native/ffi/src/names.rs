@@ -1,5 +1,5 @@
 //! Symbol names for the core's phases, refusals and orders.
-use handoff_machines::{Acked, Action, FencingToken, Order, Phase, Recipient, Refusal};
+use handoff_machines::{Action, FencingToken, Order, Phase, Recipient, Refusal};
 use magnus::{IntoValue, Ruby, Symbol, Value, prelude::*};
 
 pub const PHASES: [&str; 7] = [
@@ -31,6 +31,22 @@ pub const REFUSALS: [&str; 17] = [
     "stale_token",
     "fence_required",
 ];
+
+/// Every phase, in the order of [`PHASES`].
+const ALL: [Phase; 7] = [
+    Phase::Quiesce,
+    Phase::Drain,
+    Phase::Checkpoint,
+    Phase::Activate,
+    Phase::Rollback,
+    Phase::Complete,
+    Phase::Aborted,
+];
+
+/// The phase a symbol name names, if any.
+pub fn phase_named(name: &str) -> Option<Phase> {
+    ALL.into_iter().find(|candidate| phase(*candidate) == name)
+}
 
 pub const fn phase(phase: Phase) -> &'static str {
     match phase {
@@ -66,26 +82,15 @@ pub const fn refusal(refusal: Refusal) -> &'static str {
     }
 }
 
-/// An acknowledgement: `[duplicate, phase]` when honoured (the Ruby side
-/// wraps it as `Recorded` or `Duplicate`), or the refusal symbol.
-pub fn acked(ruby: &Ruby, outcome: Result<Acked, Refusal>) -> Value {
-    let symbol = |name| ruby.to_symbol(name);
-    match outcome {
-        Ok(Acked::Recorded(reached)) => (false, symbol(phase(reached))).into_value_with(ruby),
-        Ok(Acked::Duplicate(stands)) => (true, symbol(phase(stands))).into_value_with(ruby),
-        Err(refused) => symbol(refusal(refused)).as_value(),
-    }
-}
-
 /// Recipient (replica Integer or `:authority`), action name and its field
 /// (a token as its raw Integer);
 /// the Ruby side wraps them as `Replica` and the action `Data` values.
 pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
-    let to = match order.to {
+    let to = match order.to() {
         Recipient::Replica(replica) => replica.into_value_with(ruby),
         Recipient::Authority => ruby.to_symbol("authority").as_value(),
     };
-    let (name, value) = match order.action {
+    let (name, value) = match order.action() {
         Action::Quiesce => ("quiesce", None),
         Action::Drain { until } => ("drain", Some(until)),
         Action::Capture { at } => ("capture", Some(at)),

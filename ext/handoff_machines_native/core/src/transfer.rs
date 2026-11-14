@@ -1,28 +1,28 @@
-use core::{cmp::Ordering, time::Duration};
+use core::time::Duration;
 
 use lease_machines::FencingToken;
 use offset_machines::{Ack, Commit, Tracker};
 
 use crate::{Action, Phase, Recipient, Refusal, Status, Ticket};
 
-/// The coordinator's name for a refusal of the transfer's drain tracker.
-const fn tracked(refusal: offset_machines::Refusal) -> Refusal {
-    match refusal {
-        offset_machines::Refusal::Stale => Refusal::Stale,
-        offset_machines::Refusal::OutOfWindow => Refusal::OutOfWindow,
-        offset_machines::Refusal::Unacked => Refusal::Unacked,
-        offset_machines::Refusal::Exhausted => Refusal::Exhausted,
-    }
-}
-
+/// What the transfer waits for next. Each step carries what its order
+/// restates, so no step can stand without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Quiesce,
-    Drain,
-    Capture,
-    Install,
+    Drain {
+        until: u64,
+    },
+    Capture {
+        at: u64,
+    },
+    Install {
+        checkpoint: u64,
+    },
     Fence,
-    Activate,
+    Activate {
+        token: FencingToken,
+    },
     Rollback {
         resume: bool,
         discard: bool,
@@ -58,20 +58,36 @@ pub struct Transfer<const WORDS: usize> {
     tracker: Tracker<WORDS>,
 }
 
-/// Whether `token` may supersede `floor`, the newest token the transfer knows.
+/// Whether `token` may supersede `floor`, the newest token the transfer knows:
+/// `StaleToken` unless it exceeds it.
 ///
-/// Tokens of two scopes have no order, so "not newer" is two different
-/// answers: a token of the floor's scope that does not exceed it is
-/// `StaleToken`, and a token of another scope is `Unknown`, the name every
-/// crate gives an id that is not of the namespace the call ranks in. Neither
-/// is ever folded into the other. Every caller has passed [`Transfer::homed`]
-/// first, so the `Unknown` arm is the same answer given again, never a new one.
+/// Both are of the transfer's one token scope: `token` passed
+/// [`Transfer::homed`], and `floor` is the source token or the activation
+/// token `fenced` admitted. Within one scope a token's order is the order of
+/// its raw value, so there is no "of another scope" case left to answer here.
 const fn supersedes(token: FencingToken, floor: FencingToken) -> Result<(), Refusal> {
-    match token.order(floor) {
-        Some(Ordering::Greater) => Ok(()),
-        Some(Ordering::Less | Ordering::Equal) => Err(Refusal::StaleToken),
-        None => Err(Refusal::Unknown),
+    debug_assert!(
+        token.scope() == floor.scope(),
+        "both tokens are of the transfer's token scope"
+    );
+    if token.raw() > floor.raw() {
+        Ok(())
+    } else {
+        Err(Refusal::StaleToken)
     }
+}
+
+/// The answer for a drain-tracker refusal the transfer rules out: the tracker
+/// runs under the ticket's own (never zero) generation and is only asked to
+/// acknowledge or confirm, so neither `Stale` nor `Exhausted` can come back,
+/// and `ack` never answers `Unacked`. Refused as `OutOfPhase`, the most
+/// conservative answer; the tracker refused, so nothing changed.
+fn untracked() -> Refusal {
+    debug_assert!(
+        false,
+        "the drain tracker runs under the ticket's generation"
+    );
+    Refusal::OutOfPhase
 }
 
 /// Answer to an acknowledgement the transfer already recorded: an idempotent
@@ -119,9 +135,9 @@ impl<const WORDS: usize> Transfer<WORDS> {
     pub const fn phase(&self) -> Phase {
         match self.step {
             Step::Quiesce => Phase::Quiesce,
-            Step::Drain => Phase::Drain,
-            Step::Capture | Step::Install => Phase::Checkpoint,
-            Step::Fence | Step::Activate => Phase::Activate,
+            Step::Drain { .. } => Phase::Drain,
+            Step::Capture { .. } | Step::Install { .. } => Phase::Checkpoint,
+            Step::Fence | Step::Activate { .. } => Phase::Activate,
             Step::Rollback { .. } => Phase::Rollback,
         }
     }
@@ -146,26 +162,14 @@ impl<const WORDS: usize> Transfer<WORDS> {
         let target = Recipient::Replica(self.target);
         let (first, second) = match self.step {
             Step::Quiesce => (Some((source, Action::Quiesce)), None),
-            Step::Drain => match self.until {
-                Some(until) => (Some((source, Action::Drain { until })), None),
-                None => (None, None),
-            },
-            Step::Capture => match self.until {
-                Some(at) => (Some((source, Action::Capture { at })), None),
-                None => (None, None),
-            },
-            Step::Install => match self.checkpoint {
-                Some(checkpoint) => (Some((target, Action::Install { checkpoint })), None),
-                None => (None, None),
-            },
+            Step::Drain { until } => (Some((source, Action::Drain { until })), None),
+            Step::Capture { at } => (Some((source, Action::Capture { at })), None),
+            Step::Install { checkpoint } => (Some((target, Action::Install { checkpoint })), None),
             Step::Fence => {
                 let above = self.source_token;
                 (Some((Recipient::Authority, Action::Fence { above })), None)
             }
-            Step::Activate => match self.token {
-                Some(token) => (Some((target, Action::Activate { token })), None),
-                None => (None, None),
-            },
+            Step::Activate { token } => (Some((target, Action::Activate { token })), None),
             Step::Rollback {
                 resume,
                 discard,
@@ -191,9 +195,20 @@ impl<const WORDS: usize> Transfer<WORDS> {
     }
 
     /// Bounds of the still-unacknowledged drain: tracker and quiesce point.
-    pub fn draining(&self) -> Option<(&Tracker<WORDS>, u64)> {
-        let until = self.until?;
-        (self.step == Step::Drain).then_some((&self.tracker, until))
+    pub const fn draining(&self) -> Option<(&Tracker<WORDS>, u64)> {
+        match self.step {
+            Step::Drain { until } => Some((&self.tracker, until)),
+            Step::Quiesce
+            | Step::Capture { .. }
+            | Step::Install { .. }
+            | Step::Fence
+            | Step::Activate { .. }
+            | Step::Rollback { .. } => None,
+        }
+    }
+
+    const fn draining_now(&self) -> bool {
+        self.draining().is_some()
     }
 
     /// A token of another scope than the source token's names nothing in
@@ -208,8 +223,10 @@ impl<const WORDS: usize> Transfer<WORDS> {
         }
     }
 
-    fn expect(&self, step: Step, replica: u64, holder: u64) -> Result<(), Refusal> {
-        if self.step != step {
+    /// `OutOfPhase` unless the transfer is `waiting` for this, then
+    /// `WrongReplica` unless `replica` is the `holder`.
+    const fn expect(waiting: bool, replica: u64, holder: u64) -> Result<(), Refusal> {
+        if !waiting {
             Err(Refusal::OutOfPhase)
         } else if replica != holder {
             Err(Refusal::WrongReplica)
@@ -222,15 +239,15 @@ impl<const WORDS: usize> Transfer<WORDS> {
         if let Some(recorded) = self.until {
             return replay(replica == self.source, recorded == until);
         }
-        self.expect(Step::Quiesce, replica, self.source)?;
+        Self::expect(matches!(self.step, Step::Quiesce), replica, self.source)?;
         if until < self.tracker.base() {
             return Err(Refusal::BehindBase);
         }
         self.until = Some(until);
         self.step = if until == self.tracker.base() {
-            Step::Capture
+            Step::Capture { at: until }
         } else {
-            Step::Drain
+            Step::Drain { until }
         };
         Ok(Next::Moved)
     }
@@ -243,7 +260,7 @@ impl<const WORDS: usize> Transfer<WORDS> {
         if offset >= until {
             return Err(Refusal::BeyondDrain);
         }
-        if self.step != Step::Drain {
+        if !self.draining_now() {
             // The drain is over or was given up: only what it recorded repeats.
             return if self.tracker.is_acked(offset) {
                 Ok(Next::Repeat)
@@ -251,10 +268,15 @@ impl<const WORDS: usize> Transfer<WORDS> {
                 Err(Refusal::OutOfPhase)
             };
         }
-        let ack = self.tracker.ack(self.ticket.generation, offset);
-        match ack.map_err(tracked)? {
-            Ack::Duplicate => return Ok(Next::Repeat),
-            Ack::Recorded => {}
+        match self.tracker.ack(self.ticket.generation, offset) {
+            Ok(Ack::Duplicate) => return Ok(Next::Repeat),
+            Ok(Ack::Recorded) => {}
+            Err(offset_machines::Refusal::OutOfWindow) => return Err(Refusal::OutOfWindow),
+            Err(
+                offset_machines::Refusal::Stale
+                | offset_machines::Refusal::Unacked
+                | offset_machines::Refusal::Exhausted,
+            ) => return Err(untracked()),
         }
         let reached = self
             .tracker
@@ -263,7 +285,7 @@ impl<const WORDS: usize> Transfer<WORDS> {
         if reached < until {
             return Ok(Next::Same);
         }
-        self.step = Step::Capture;
+        self.step = Step::Capture { at: until };
         Ok(Next::Moved)
     }
 
@@ -274,27 +296,33 @@ impl<const WORDS: usize> Transfer<WORDS> {
         if replica != self.source {
             return Err(Refusal::WrongReplica);
         }
-        if self.step != Step::Drain {
+        if !self.draining_now() {
             return if offset <= self.tracker.base() {
                 Ok(Next::Repeat)
             } else {
                 Err(Refusal::OutOfPhase)
             };
         }
-        let commit = self.tracker.mark_committed(self.ticket.generation, offset);
-        Ok(match commit.map_err(tracked)? {
-            Commit::Duplicate => Next::Repeat,
-            Commit::Advanced => Next::Same,
-        })
+        match self.tracker.mark_committed(self.ticket.generation, offset) {
+            Ok(Commit::Duplicate) => Ok(Next::Repeat),
+            Ok(Commit::Advanced) => Ok(Next::Same),
+            Err(offset_machines::Refusal::Unacked) => Err(Refusal::Unacked),
+            Err(
+                offset_machines::Refusal::Stale
+                | offset_machines::Refusal::OutOfWindow
+                | offset_machines::Refusal::Exhausted,
+            ) => Err(untracked()),
+        }
     }
 
     pub fn captured(&mut self, replica: u64, checkpoint: u64) -> Result<Next, Refusal> {
         if let Some(recorded) = self.checkpoint {
             return replay(replica == self.source, recorded == checkpoint);
         }
-        self.expect(Step::Capture, replica, self.source)?;
+        let waiting = matches!(self.step, Step::Capture { .. });
+        Self::expect(waiting, replica, self.source)?;
         self.checkpoint = Some(checkpoint);
-        self.step = Step::Install;
+        self.step = Step::Install { checkpoint };
         Ok(Next::Moved)
     }
 
@@ -303,7 +331,8 @@ impl<const WORDS: usize> Transfer<WORDS> {
             let same = self.checkpoint == Some(checkpoint);
             return replay(replica == self.target, same);
         }
-        self.expect(Step::Install, replica, self.target)?;
+        let waiting = matches!(self.step, Step::Install { .. });
+        Self::expect(waiting, replica, self.target)?;
         if self.checkpoint != Some(checkpoint) {
             return Err(Refusal::Mismatch);
         }
@@ -322,13 +351,14 @@ impl<const WORDS: usize> Transfer<WORDS> {
         }
         supersedes(token, self.source_token)?;
         self.token = Some(token);
-        self.step = Step::Activate;
+        self.step = Step::Activate { token };
         Ok(Next::Moved)
     }
 
     pub fn activated(&self, replica: u64, token: FencingToken) -> Result<Next, Refusal> {
         self.homed(token)?;
-        self.expect(Step::Activate, replica, self.target)?;
+        let waiting = matches!(self.step, Step::Activate { .. });
+        Self::expect(waiting, replica, self.target)?;
         if self.token != Some(token) {
             return Err(Refusal::Mismatch);
         }
@@ -343,8 +373,8 @@ impl<const WORDS: usize> Transfer<WORDS> {
             Step::Rollback {
                 token: recorded, ..
             } => return replay(true, recorded == token),
-            Step::Quiesce | Step::Drain | Step::Capture => false,
-            Step::Install | Step::Fence | Step::Activate => true,
+            Step::Quiesce | Step::Drain { .. } | Step::Capture { .. } => false,
+            Step::Install { .. } | Step::Fence | Step::Activate { .. } => true,
         };
         // The activation token is of the source token's scope: `fenced`
         // admitted it. So the floor always names the transfer's one scope.
@@ -352,7 +382,7 @@ impl<const WORDS: usize> Transfer<WORDS> {
         if let Some(token) = token {
             supersedes(token, floor)?;
         }
-        if token.is_none() && self.step == Step::Activate {
+        if token.is_none() && matches!(self.step, Step::Activate { .. }) {
             return Err(Refusal::FenceRequired);
         }
         self.step = Step::Rollback {

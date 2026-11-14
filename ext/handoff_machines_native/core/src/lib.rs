@@ -73,11 +73,14 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         if scope_of(last_generation) != scope {
             return None;
         }
-        match Issuer::resumed(scope, sequence_of(last_generation)) {
-            Some(generations) => Some(Self::resuming(limits, generations)),
-            // Unreachable: a sequence taken out of an id is never past the last.
-            None => None,
-        }
+        let Some(generations) = Issuer::resumed(scope, sequence_of(last_generation)) else {
+            debug_assert!(
+                false,
+                "a sequence taken out of an id is never past the last"
+            );
+            return None;
+        };
+        Some(Self::resuming(limits, generations))
     }
 
     const fn resuming(limits: Limits, generations: Issuer) -> Self {
@@ -128,6 +131,9 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// Its scope is the transfer's token scope: every later token is ranked
     /// against it, and one of another scope is [`Refusal::Unknown`].
     ///
+    /// An honoured start records `now`: the first phase's deadline is
+    /// counted from it.
+    ///
     /// # Errors
     /// `ClockRegressed`, `SameReplica`, `Busy`, `Full`, `ReplicaBusy` or `Exhausted`.
     pub fn start(
@@ -146,14 +152,19 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         if self.find(partition).is_some() {
             return Err(Refusal::Busy);
         }
-        let free = self.slots.iter().position(Option::is_none);
-        let free = free.ok_or(Refusal::Full)?;
-        if self.load(source) >= self.limits.per_replica
-            || self.load(target) >= self.limits.per_replica
-        {
+        let crowded = self.load(source) >= self.limits.per_replica
+            || self.load(target) >= self.limits.per_replica;
+        let deadline = self.deadline(now);
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(Refusal::Full);
+        };
+        if crowded {
             return Err(Refusal::ReplicaBusy);
         }
-        let generation = match self.generations.peek() {
+        // Issued on a copy, kept only once the transfer exists: a refused
+        // start consumes no generation.
+        let mut generations = self.generations;
+        let generation = match generations.issue() {
             Ok(generation) => generation,
             Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
         };
@@ -161,14 +172,13 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
             partition,
             generation,
         };
-        let deadline = self.deadline(now);
-        let transfer = Transfer::new(ticket, source, target, base, source_token, deadline)
-            .ok_or(Refusal::Exhausted)?;
-        let slot = self.slots.get_mut(free).ok_or(Refusal::Full)?;
-        match self.generations.issue() {
-            Ok(_) => *slot = Some(transfer),
-            Err(periscope_machines::Refusal::Exhausted) => return Err(Refusal::Exhausted),
-        }
+        let Some(transfer) = Transfer::new(ticket, source, target, base, source_token, deadline)
+        else {
+            debug_assert!(false, "a fresh drain tracker accepts any issued generation");
+            return Err(Refusal::Exhausted);
+        };
+        *slot = Some(transfer);
+        self.generations = generations;
         self.observed = now;
         Ok(ticket)
     }
@@ -378,9 +388,7 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// The transfer currently moving `partition`, if any.
     #[must_use]
     pub fn status(&self, partition: u64) -> Option<Status> {
-        self.find(partition)
-            .and_then(|index| self.slots.get(index)?.as_ref())
-            .map(Transfer::status)
+        self.find(partition).map(Transfer::status)
     }
 
     /// Outstanding orders from position `from` (zero to begin). At most two
@@ -401,11 +409,7 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         ticket: Ticket,
         from: u64,
     ) -> Result<Outstanding<'_, WORDS>, Refusal> {
-        let index = self.locate(ticket)?;
-        let transfer = self.slots.get(index).and_then(Option::as_ref);
-        let (tracker, until) = transfer
-            .and_then(Transfer::draining)
-            .ok_or(Refusal::OutOfPhase)?;
+        let (tracker, until) = self.locate(ticket)?.draining().ok_or(Refusal::OutOfPhase)?;
         Ok(Outstanding::new(tracker, from, until))
     }
 
@@ -429,11 +433,9 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         now.saturating_add(self.limits.phase_budget)
     }
 
-    fn find(&self, partition: u64) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            slot.as_ref()
-                .is_some_and(|transfer| transfer.ticket.partition == partition)
-        })
+    fn find(&self, partition: u64) -> Option<&Transfer<WORDS>> {
+        let mut live = self.slots.iter().flatten();
+        live.find(|transfer| transfer.ticket.partition == partition)
     }
 
     fn load(&self, replica: u64) -> usize {
@@ -444,18 +446,19 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
     /// A generation this coordinator did not issue (another scope, or a
     /// sequence it has not reached) is unknown: no slot is read. One it did
     /// issue and holds in no slot is stale.
-    fn locate(&self, ticket: Ticket) -> Result<usize, Refusal> {
+    fn locate(&self, ticket: Ticket) -> Result<&Transfer<WORDS>, Refusal> {
         if !self.generations.owns(ticket.generation) {
             return Err(Refusal::Unknown);
         }
-        let index = self.slots.iter().position(|slot| {
-            slot.as_ref()
-                .is_some_and(|transfer| transfer.ticket == ticket)
-        });
-        index.ok_or(Refusal::Stale)
+        let mut live = self.slots.iter().flatten();
+        live.find(|transfer| transfer.ticket == ticket)
+            .ok_or(Refusal::Stale)
     }
 
-    /// A repeat answers before `observed` moves: it changes nothing at all.
+    /// Answer one acknowledgement. Only an acknowledgement that moves the
+    /// transfer to a new wait records `now`: the new phase's deadline is
+    /// counted from it. A repeat, a step within the same wait and the end of
+    /// the transfer answer the same whatever the time, and record nothing.
     fn acked(
         &mut self,
         ticket: Ticket,
@@ -463,24 +466,30 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         ack: impl FnOnce(&mut Transfer<WORDS>) -> Result<Next, Refusal>,
     ) -> Result<Acked, Refusal> {
         self.clock(now)?;
-        let index = self.locate(ticket)?;
+        if !self.generations.owns(ticket.generation) {
+            return Err(Refusal::Unknown);
+        }
         let deadline = self.deadline(now);
-        let slot = self.slots.get_mut(index).ok_or(Refusal::Unknown)?;
-        let transfer = slot.as_mut().ok_or(Refusal::Unknown)?;
-        let phase = match ack(transfer)? {
-            Next::Repeat => return Ok(Acked::Duplicate(transfer.phase())),
-            Next::Same => transfer.phase(),
-            Next::Moved => {
-                transfer.deadline = deadline;
-                transfer.phase()
+        for slot in &mut self.slots {
+            let Some(transfer) = slot else { continue };
+            if transfer.ticket != ticket {
+                continue;
             }
-            Next::Done(phase) => {
-                *slot = None;
-                phase
-            }
-        };
-        self.observed = now;
-        Ok(Acked::Recorded(phase))
+            return Ok(match ack(transfer)? {
+                Next::Repeat => Acked::Duplicate(transfer.phase()),
+                Next::Same => Acked::Recorded(transfer.phase()),
+                Next::Moved => {
+                    transfer.deadline = deadline;
+                    self.observed = now;
+                    Acked::Recorded(transfer.phase())
+                }
+                Next::Done(phase) => {
+                    *slot = None;
+                    Acked::Recorded(phase)
+                }
+            });
+        }
+        Err(Refusal::Stale)
     }
 }
 

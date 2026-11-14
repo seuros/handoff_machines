@@ -170,15 +170,17 @@ impl Model {
         match rule(&mut self.moves[index], self.window)? {
             End::Repeat => return Ok(Acked::Duplicate(self.moves[index].phase())),
             End::Yes(phase) => {
-                self.seen = now;
+                // The end of a transfer holds whatever the time: no clock.
                 self.moves.remove(index);
                 return Ok(Acked::Recorded(phase));
             }
-            End::No => self.seen = now,
+            End::No => {}
         }
         let entry = &mut self.moves[index];
+        // Only a new wait depends on `now`: its deadline counts from it.
         if entry.wait != before {
             entry.deadline = now.saturating_add(self.limits.phase_budget);
+            self.seen = now;
         }
         Ok(Acked::Recorded(entry.phase()))
     }

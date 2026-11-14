@@ -3,10 +3,12 @@ use std::vec::Vec;
 
 use super::*;
 
+mod draws;
 mod edges;
 mod model;
 mod random;
 mod replays;
+mod rules;
 mod scope;
 mod tokens;
 
@@ -335,16 +337,6 @@ fn concurrent_transfers_are_bounded_by_slots_and_per_replica() {
     assert_eq!(
         (Handoff::<0, 1>::CAPACITY, Handoff::<3, 2>::WINDOW),
         (0, 128)
-    );
-    let closed = Limits {
-        per_replica: 0,
-        ..LIMITS
-    };
-    let mut shut = Small::new(closed);
-    assert_eq!(shut.limits(), closed);
-    assert_eq!(
-        shut.start(1, 1, 2, 0, token(1), at(0)),
-        Err(Refusal::ReplicaBusy)
     );
 }
 

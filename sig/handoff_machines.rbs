@@ -59,6 +59,11 @@ module HandoffMachines
     def newer_than?: (_FencingToken other) -> bool
   end
 
+  # Every Data value below is valid or does not exist: `new` checks it through
+  # the core constructor of the type it mirrors. TypeError for a value of the
+  # wrong type, RangeError for one the core would not build.
+
+  # The core's `Limits::new`: RangeError when `per_replica` is zero.
   class Limits < Data
     attr_reader phase_budget: nanoseconds
     attr_reader per_replica: Integer
@@ -66,6 +71,7 @@ module HandoffMachines
                 | (phase_budget: nanoseconds, per_replica: Integer) -> Limits
   end
 
+  # The core's `Ticket::new`: RangeError for a generation with a zero sequence.
   class Ticket < Data
     attr_reader partition: Integer
     # Never zero, never reused: the issuing coordinator's scope in the top
@@ -77,6 +83,8 @@ module HandoffMachines
     def scope: () -> Integer
   end
 
+  # The core's `Acked::recorded`: RangeError for :quiesce or a Symbol that is
+  # not a phase.
   class Recorded < Data
     attr_reader phase: phase
     def self.new: (phase phase) -> Recorded
@@ -84,6 +92,8 @@ module HandoffMachines
     def duplicate?: () -> false
   end
 
+  # The core's `Acked::duplicate`: RangeError for :quiesce, :complete,
+  # :aborted or a Symbol that is not a phase.
   class Duplicate < Data
     attr_reader phase: phase
     def self.new: (phase phase) -> Duplicate
@@ -91,6 +101,7 @@ module HandoffMachines
     def duplicate?: () -> true
   end
 
+  # Integer ids in 0..2**64-1.
   class Replica < Data
     attr_reader id: Integer
     def self.new: (Integer id) -> Replica
@@ -98,9 +109,11 @@ module HandoffMachines
   end
 
   # Source: finish in-flight offsets below `until` and acknowledge each.
+  # Offsets and checkpoint ids are Integers in 0..2**64-1.
   class Drain < Data
     attr_reader until: Integer
     def self.new: (Integer until_offset) -> Drain
+                | (until: Integer) -> Drain
   end
 
   # Source: capture a checkpoint at exactly `at`.
@@ -118,26 +131,33 @@ module HandoffMachines
   end
 
   # Authority: issue the target a token of `above`'s scope, strictly newer.
+  # Like Activate, Resume and Status, it keeps this gem's FencingToken: a
+  # sibling gem's token is converted on the way in, so `==` holds.
   class Fence < Data
     attr_reader above: FencingToken
-    def self.new: (FencingToken above) -> Fence
-                | (above: FencingToken) -> Fence
+    def self.new: (_FencingToken above) -> Fence
+                | (above: _FencingToken) -> Fence
   end
 
   # Target: start serving under `token`.
   class Activate < Data
     attr_reader token: FencingToken
-    def self.new: (FencingToken token) -> Activate
-                | (token: FencingToken) -> Activate
+    def self.new: (_FencingToken token) -> Activate
+                | (token: _FencingToken) -> Activate
   end
 
   # Source: resume serving; under `token` when the rollback was fenced.
   class Resume < Data
     attr_reader token: FencingToken?
-    def self.new: (FencingToken? token) -> Resume
-                | (token: FencingToken?) -> Resume
+    def self.new: (_FencingToken? token) -> Resume
+                | (token: _FencingToken?) -> Resume
   end
 
+  # The core's `Order::new`: RangeError unless only the authority is asked
+  # to fence and it is asked nothing else, or for a recipient Symbol other
+  # than :authority or an action Symbol other than :quiesce and :discard (a
+  # bare :resume included: it is `Resume.new(nil)`). TypeError for a ticket,
+  # replica or action Data that is not exactly this gem's class.
   class Order < Data
     attr_reader ticket: Ticket
     attr_reader to: recipient
@@ -146,6 +166,10 @@ module HandoffMachines
                 | (ticket: Ticket, to: recipient, action: action) -> Order
   end
 
+  # The core's `Status::checked`: an issued ticket, two different replicas,
+  # a phase that is not final and only what that phase has recorded; during
+  # the drain, a quiesce point above `base`. The
+  # deadline may exceed 2**64-1: the core saturates now + phase_budget.
   class Status < Data
     attr_reader ticket: Ticket
     attr_reader source: Integer
@@ -157,7 +181,9 @@ module HandoffMachines
     attr_reader token: FencingToken?
     attr_reader deadline: nanoseconds
     def self.new: (Ticket ticket, Integer source, Integer target, phase phase, Integer base, Integer? until_offset,
-                   Integer? checkpoint, FencingToken? token, nanoseconds deadline) -> Status
+                   Integer? checkpoint, _FencingToken? token, nanoseconds deadline) -> Status
+                | (ticket: Ticket, source: Integer, target: Integer, phase: phase, base: Integer, until: Integer?,
+                   checkpoint: Integer?, token: _FencingToken?, deadline: nanoseconds) -> Status
   end
 
   # The core's `Handoff<16, 4>`. Honoured answers come first in every return
@@ -227,41 +253,32 @@ module HandoffMachines
 
     private
 
-    ACTIONS: Hash[Symbol, singleton(Data)]
-    TOKENED: Array[Symbol]
-    def raw: (_FencingToken) -> Integer
-    def self.fields: (Limits) -> [Integer, Integer]
-    def self.native_with_scope: (Integer, Integer, Integer) -> Handoff
-    def self.native_restored: (Integer, Integer, [Integer, Integer]) -> Handoff
-    def self.native_scope_of: (Integer) -> Integer
+    def self.native_with_scope: (Limits, Integer) -> Handoff
+    def self.native_restored: (Limits, Integer, Integer) -> Handoff
+    def self.native_scope_of: (Ticket) -> Integer
     def native_limits: () -> [Integer, Integer]
-    def key: (Ticket) -> [Integer, Integer]
-    def acked: (Symbol | [bool, phase]) -> (acked | Symbol)
     def order: (Integer, Integer, Integer | :authority, Symbol, Integer?) -> Order
-    def native_start: (Integer, [Integer, Integer], Integer, Integer, Integer) -> ([Integer, Integer] | refusal)
-    def native_quiesced: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_drained: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_committed: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_captured: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_installed: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_fenced: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_activated: (Integer, Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_abort: (Integer, Integer, Integer?, Integer) -> (Symbol | [bool, phase])
-    def native_resumed: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
-    def native_discarded: (Integer, Integer, Integer, Integer) -> (Symbol | [bool, phase])
+    def action: (Symbol, Integer?) -> action
     def native_status: (Integer) -> [Array[untyped], Array[untyped]]?
     def native_orders: (Integer, Integer) -> [Array[Array[untyped]], Integer]
-    def native_outstanding: (Integer, Integer, Integer, Integer) -> (Array[Integer] | refusal)
     def native_overdue: (Integer, Integer, Integer) -> [Array[[Integer, Integer]], Integer]
   end
 
   private
 
-  def self.native_token_scope: (Integer) -> Integer
-  def self.native_token_order: (Integer, Integer) -> (-1 | 0 | 1)?
-  def self.native_token_newer: (Integer, Integer) -> bool
-
-  module Rows
-    def self?.raw: (_FencingToken) -> Integer
-  end
+  ACTIONS: Hash[Symbol, singleton(Data)]
+  TOKENED: Array[Symbol]
+  def self.native_raw: (Integer) -> nil
+  def self.native_token_scope: (_FencingToken) -> Integer
+  def self.native_token_order: (_FencingToken, _FencingToken) -> (-1 | 0 | 1)?
+  def self.native_token_newer: (_FencingToken, _FencingToken) -> bool
+  def self.__limits: (Integer, Integer) -> nil
+  def self.__ticket: (Integer, Integer) -> nil
+  def self.__recorded: (phase) -> nil
+  def self.__duplicate: (phase) -> nil
+  def self.__u64: (Integer) -> nil
+  def self.__token: (_FencingToken) -> FencingToken
+  def self.__order: (Ticket, recipient, action) -> nil
+  def self.__status: (Ticket, Integer, Integer, phase, Integer, Integer?, Integer?, _FencingToken?, Integer)
+                     -> FencingToken?
 end

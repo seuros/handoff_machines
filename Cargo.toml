@@ -10,11 +10,11 @@ license = "MIT"
 
 [workspace.dependencies]
 handoff-machines = { path = "ext/handoff_machines_native/core" }
-magnus = { version = "0.9.3", default-features = false }
+magnus = { version = "0.9.3", default-features = false, features = ["rb-sys"] }
 rb-sys = { version = "0.9.130", default-features = false, features = ["stable-api-compiled-fallback"] }
-lease-machines = ">=0.4"
-offset-machines = ">=0.3"
-periscope-machines = ">=0.3"
+lease-machines = ">=0.5"
+offset-machines = ">=0.4"
+periscope-machines = ">=0.4"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

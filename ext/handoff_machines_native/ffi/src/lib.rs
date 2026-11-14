@@ -1,13 +1,17 @@
 //! Thin binding to the bounded partition handoff coordinator.
+mod classes;
+mod handoff;
 mod init;
 mod names;
+mod values;
 
-use std::{cell::RefCell, cmp::Ordering, time::Duration};
+use std::{cmp::Ordering, time::Duration};
 
-use handoff_machines::{Acked, FencingToken, Limits, Refusal, Ticket};
-use magnus::{
-    Error, Integer, IntoValue, RArray, Ruby, TryConvert, Value, prelude::*, typed_data::Obj,
-};
+use handoff_machines::{FencingToken, Ticket};
+use magnus::{Error, Integer, Ruby, TryConvert, Value};
+
+use handoff::Handoff;
+use values::{TicketValue, TokenValue};
 
 /// Concurrent transfers compiled into the binding.
 const CAPACITY: usize = 16;
@@ -15,19 +19,24 @@ const CAPACITY: usize = 16;
 const WORDS: usize = 4;
 
 type Core = handoff_machines::Handoff<CAPACITY, WORDS>;
-type Outcome = Result<Acked, Refusal>;
+
+/// `TypeError` unless `value` is an Integer.
+fn integer(value: Value, message: &'static str) -> Result<(), Error> {
+    match Integer::from_value(value) {
+        Some(_) => Ok(()),
+        None => Err(Error::new(
+            Ruby::get_with(value).exception_type_error(),
+            message,
+        )),
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Number(u64);
 
 impl TryConvert for Number {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                Ruby::get_with(value).exception_type_error(),
-                "expected an Integer (unsigned 64-bit)",
-            ));
-        }
+        integer(value, "expected an Integer (unsigned 64-bit)")?;
         u64::try_convert(value).map(Self)
     }
 }
@@ -60,361 +69,51 @@ struct Scope(u16);
 
 impl TryConvert for Scope {
     fn try_convert(value: Value) -> Result<Self, Error> {
-        let ruby = Ruby::get_with(value);
-        if Integer::from_value(value).is_none() {
-            return Err(Error::new(
-                ruby.exception_type_error(),
-                "scope must be an Integer",
-            ));
-        }
-        u16::try_convert(value)
-            .map(Self)
-            .map_err(|_| Error::new(ruby.exception_range_error(), "scope must be in 0..=65535"))
+        integer(value, "scope must be an Integer")?;
+        u16::try_convert(value).map(Self).map_err(|_| {
+            Error::new(
+                Ruby::get_with(value).exception_range_error(),
+                "scope must be in 0..=65535",
+            )
+        })
     }
 }
 
 /// The scope a ticket's generation carries: `Ticket#scope`.
-const fn scope_of(generation: Number) -> u16 {
-    ticket(Number(0), generation).scope()
+const fn scope_of(ticket: TicketValue) -> u16 {
+    ticket.0.scope()
 }
 
-/// `FencingToken#scope`; converting the token is what validates it.
-fn token_scope(ruby: &Ruby, token: Number) -> Result<u16, Error> {
-    Ok(token.token(ruby)?.scope())
+/// `HandoffMachines.native_raw`: what `FencingToken.new` validates.
+fn validate_raw(ruby: &Ruby, raw: Number) -> Result<(), Error> {
+    raw.token(ruby).map(drop)
+}
+
+/// `FencingToken#scope`; reading the token is what validates it.
+const fn token_scope(token: TokenValue) -> u16 {
+    token.0.scope()
 }
 
 /// `FencingToken#order`: -1, 0, 1, or `nil` across scopes.
-fn token_order(ruby: &Ruby, token: Number, other: Number) -> Result<Option<i8>, Error> {
-    let order = token.token(ruby)?.order(other.token(ruby)?);
-    Ok(order.map(|order| match order {
+fn token_order(token: TokenValue, other: TokenValue) -> Option<i8> {
+    token.0.order(other.0).map(|order| match order {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
-    }))
-}
-
-/// `FencingToken#newer_than?`.
-fn token_newer(ruby: &Ruby, token: Number, other: Number) -> Result<bool, Error> {
-    Ok(token.token(ruby)?.is_newer_than(other.token(ruby)?))
-}
-
-const fn ticket(partition: Number, generation: Number) -> Ticket {
-    Ticket {
-        partition: partition.0,
-        generation: generation.0,
-    }
-}
-
-#[magnus::wrap(class = "HandoffMachines::Handoff", free_immediately, size)]
-struct Handoff {
-    core: RefCell<Core>,
-}
-
-fn limits(ruby: &Ruby, phase_budget: Number, per_replica: Number) -> Result<Limits, Error> {
-    Ok(Limits {
-        phase_budget: phase_budget.at(),
-        per_replica: per_replica.index(ruby)?,
     })
 }
 
-impl Handoff {
-    fn with_scope(
-        ruby: &Ruby,
-        phase_budget: Number,
-        per_replica: Number,
-        scope: Scope,
-    ) -> Result<Self, Error> {
-        let limits = limits(ruby, phase_budget, per_replica)?;
-        Ok(Self {
-            core: RefCell::new(Core::with_scope(limits, scope.0)),
-        })
-    }
+/// `FencingToken#newer_than?`.
+const fn token_newer(token: TokenValue, other: TokenValue) -> bool {
+    token.0.is_newer_than(other.0)
+}
 
-    fn restored(
-        ruby: &Ruby,
-        phase_budget: Number,
-        per_replica: Number,
-        saved: (Scope, Number),
-    ) -> Result<Self, Error> {
-        let limits = limits(ruby, phase_budget, per_replica)?;
-        let (scope, last_generation) = saved;
-        Core::restored(limits, scope.0, last_generation.0)
-            .map(|core| Self {
-                core: RefCell::new(core),
-            })
-            .ok_or_else(|| {
-                Error::new(
-                    ruby.exception_range_error(),
-                    "last_generation is not a generation of this scope",
-                )
-            })
-    }
-
-    fn scope(&self) -> u16 {
-        self.core.borrow().scope()
-    }
-
-    fn limits(&self) -> (u128, usize) {
-        let limits = self.core.borrow().limits();
-        (limits.phase_budget.as_nanos(), limits.per_replica)
-    }
-
-    fn start(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        replicas: (Number, Number),
-        base: Number,
-        source_token: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        this.check_frozen()?;
-        let held = source_token.token(ruby)?;
-        let (source, target) = replicas;
-        let started =
-            this.core
-                .borrow_mut()
-                .start(partition.0, source.0, target.0, base.0, held, now.at());
-        Ok(match started {
-            Ok(ticket) => (ticket.partition, ticket.generation).into_value_with(ruby),
-            Err(refusal) => ruby.to_symbol(names::refusal(refusal)).as_value(),
-        })
-    }
-
-    /// Every acknowledgement: `[duplicate, phase]` when honoured, or the
-    /// refusal symbol.
-    fn ack(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        ack: impl FnOnce(&mut Core) -> Outcome,
-    ) -> Result<Value, Error> {
-        this.check_frozen()?;
-        let outcome = ack(&mut this.core.borrow_mut());
-        Ok(names::acked(ruby, outcome))
-    }
-
-    fn quiesced(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        until: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.quiesced(ticket, replica.0, until.0, now.at())
-        })
-    }
-
-    fn drained(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        offset: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.drained(ticket, replica.0, offset.0, now.at())
-        })
-    }
-
-    fn committed(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        offset: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.committed(ticket, replica.0, offset.0, now.at())
-        })
-    }
-
-    fn captured(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        checkpoint: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.captured(ticket, replica.0, checkpoint.0, now.at())
-        })
-    }
-
-    fn installed(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        checkpoint: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.installed(ticket, replica.0, checkpoint.0, now.at())
-        })
-    }
-
-    fn fenced(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        token: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let (ticket, token) = (ticket(partition, generation), token.token(ruby)?);
-        Self::ack(ruby, this, |core| core.fenced(ticket, token, now.at()))
-    }
-
-    fn activated(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        token: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let (ticket, token) = (ticket(partition, generation), token.token(ruby)?);
-        Self::ack(ruby, this, |core| {
-            core.activated(ticket, replica.0, token, now.at())
-        })
-    }
-
-    fn abort(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        token: Option<Number>,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        let token = token.map(|token| token.token(ruby)).transpose()?;
-        Self::ack(ruby, this, |core| core.abort(ticket, token, now.at()))
-    }
-
-    fn resumed(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| core.resumed(ticket, replica.0, now.at()))
-    }
-
-    fn discarded(
-        ruby: &Ruby,
-        this: Obj<Self>,
-        partition: Number,
-        generation: Number,
-        replica: Number,
-        now: Number,
-    ) -> Result<Value, Error> {
-        let ticket = ticket(partition, generation);
-        Self::ack(ruby, this, |core| {
-            core.discarded(ticket, replica.0, now.at())
-        })
-    }
-
-    fn status(ruby: &Ruby, this: &Self, partition: Number) -> Option<Value> {
-        let status = this.core.borrow().status(partition.0)?;
-        let head = (
-            status.ticket.partition,
-            status.ticket.generation,
-            status.source,
-            status.target,
-            ruby.to_symbol(names::phase(status.phase)),
-        );
-        let tail = (
-            status.base,
-            status.until,
-            status.checkpoint,
-            status.token.map(FencingToken::raw),
-            status.deadline.as_nanos(),
-        );
-        Some((head, tail).into_value_with(ruby))
-    }
-
-    fn orders(
-        ruby: &Ruby,
-        this: &Self,
-        from: Number,
-        limit: Number,
-    ) -> Result<(RArray, usize), Error> {
-        let core = this.core.borrow();
-        let mut pass = core.orders(from.index(ruby)?);
-        let list = ruby.ary_new();
-        for order in pass.by_ref().take(limit.index(ruby)?) {
-            let (to, action, value) = names::order(ruby, &order);
-            let ticket = order.ticket;
-            list.push((ticket.partition, ticket.generation, to, action, value))?;
-        }
-        Ok((list, pass.position()))
-    }
-
-    fn outstanding(
-        ruby: &Ruby,
-        this: &Self,
-        partition: Number,
-        generation: Number,
-        from: Number,
-        limit: Number,
-    ) -> Result<Value, Error> {
-        let core = this.core.borrow();
-        let limit = limit.index(ruby)?;
-        Ok(
-            match core.outstanding(ticket(partition, generation), from.0) {
-                Ok(missing) => {
-                    let list = ruby.ary_new();
-                    for offset in missing.take(limit) {
-                        list.push(offset)?;
-                    }
-                    list.as_value()
-                }
-                Err(refusal) => ruby.to_symbol(names::refusal(refusal)).as_value(),
-            },
+/// The core's `Ticket::new`, or the `RangeError` its `None` stands for.
+fn ticket(ruby: &Ruby, partition: Number, generation: Number) -> Result<Ticket, Error> {
+    Ticket::new(partition.0, generation.0).ok_or_else(|| {
+        Error::new(
+            ruby.exception_range_error(),
+            "no coordinator issues a generation with a zero sequence",
         )
-    }
-
-    fn overdue(
-        ruby: &Ruby,
-        this: &Self,
-        now: Number,
-        from: Number,
-        limit: Number,
-    ) -> Result<(RArray, usize), Error> {
-        let core = this.core.borrow();
-        let mut pass = core.overdue(now.at(), from.index(ruby)?);
-        let list = ruby.ary_new();
-        for ticket in pass.by_ref().take(limit.index(ruby)?) {
-            list.push((ticket.partition, ticket.generation))?;
-        }
-        Ok((list, pass.position()))
-    }
-
-    fn active(&self) -> usize {
-        self.core.borrow().active()
-    }
-
-    fn generation(&self) -> u64 {
-        self.core.borrow().generation()
-    }
+    })
 }

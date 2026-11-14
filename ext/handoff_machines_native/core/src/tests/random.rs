@@ -1,9 +1,10 @@
 //! Randomized comparison of the core against the naive model.
 use std::{collections::BTreeSet, format, string::String, vec::Vec};
 
+use super::draws::{Draws, fencing, sorted};
 use super::model::{Model, Wait};
 use super::{LIMITS, token};
-use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Ticket};
+use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Status, Ticket};
 use periscope_machines::{scope_of, scoped, sequence_of};
 
 const N: usize = 4;
@@ -22,42 +23,6 @@ const ACKS: [&str; 10] = [
     "resumed",
     "discarded",
 ];
-
-struct Draws(u64);
-
-impl Draws {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.below(100) < percent
-    }
-}
-
-/// Token `sequence` as a raw value: of the run's token scope `home`, or one
-/// time in twelve of a neighbouring scope, whose raw values lie above or below.
-fn fencing(sequence: u64, home: u16, d: &mut Draws) -> u64 {
-    let scope = match d.below(24) {
-        0 => home.wrapping_add(1),
-        1 => home.wrapping_sub(1),
-        _ => home,
-    };
-    scoped(scope, sequence)
-}
-
-fn sorted(orders: impl IntoIterator<Item = Order>) -> Vec<String> {
-    let mut lines: Vec<String> = orders.into_iter().map(|o| format!("{o:?}")).collect();
-    lines.sort();
-    lines
-}
 
 struct Run {
     core: Handoff<N, WORDS>,
@@ -318,6 +283,15 @@ impl Run {
             self.seen
                 .insert(format!("foreign token at {}", ACKS[choice.min(9) as usize]));
         }
+        // Every honoured acknowledgement is one its constructor admits.
+        if let Ok(acked) = got {
+            let rebuilt = if acked.is_duplicate() {
+                Acked::duplicate(acked.phase())
+            } else {
+                Acked::recorded(acked.phase())
+            };
+            assert_eq!(rebuilt, Some(acked));
+        }
         if got.is_ok_and(Acked::is_duplicate) {
             self.seen
                 .insert(format!("repeat of {}", ACKS[choice.min(9) as usize]));
@@ -341,7 +315,15 @@ impl Run {
         assert_eq!(self.core.generation(), issued);
         assert_eq!(self.core.scope(), self.model.scope);
         for partition in 0..6 {
-            assert_eq!(self.core.status(partition), self.model.status(partition));
+            let status = self.core.status(partition);
+            assert_eq!(status, self.model.status(partition));
+            assert_eq!(status.and_then(Status::checked), status, "{status:?}");
+        }
+        for order in self.core.orders(0) {
+            assert_eq!(
+                Order::new(order.ticket, order.to, order.action),
+                Some(order)
+            );
         }
         assert_eq!(sorted(self.core.orders(0)), sorted(self.model.orders()));
         let mut late: Vec<Ticket> = self.core.overdue(self.now, 0).collect();
