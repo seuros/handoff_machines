@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/handoff_machines/compare/handoff-machines-v0.6.0...handoff-machines-v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* adopt matryona-machines 0.2 and name every hook's real field
+
+### Features
+
+* adopt matryona-machines 0.2 and name every hook's real field ([fcee7fe](https://github.com/seuros/handoff_machines/commit/fcee7fef7c1c8dee5e5ec4908969130ea304ace6))
+
 ## [0.6.0](https://github.com/seuros/handoff_machines/compare/handoff-machines-v0.5.0...handoff-machines-v0.6.0) (2026-11-14)
 
 
