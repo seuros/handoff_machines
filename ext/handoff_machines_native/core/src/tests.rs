@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used)] // Failed test assumptions should panic.
 use std::vec::Vec;
 
+use matryona_machines::testing::{refuses, unchanged};
+
 use super::*;
 
 mod draws;
@@ -155,17 +157,15 @@ fn abort_rolls_back_from_each_phase() {
         assert_eq!(h.discarded(t, 1, at(2)), Err(Refusal::WrongReplica));
         if discard {
             assert_eq!(h.resumed(t, 1, at(2)), recorded(Phase::Rollback));
-            let before = h.clone();
-            let again = h.resumed(t, 1, at(9));
+            // A repeat changes nothing, not even the clock.
+            let again = unchanged(&mut h, |h| h.resumed(t, 1, at(9)));
             assert_eq!(again, repeat(Phase::Rollback));
-            assert_eq!(h, before, "a repeat changes nothing, not even the clock");
             assert_eq!(orders(&h), [(TARGET, Action::Discard)]);
             assert_eq!(h.discarded(t, 2, at(3)), recorded(Phase::Aborted));
         } else {
-            let before = h.clone();
-            let unowed = h.discarded(t, 2, at(9));
+            // A discard never owed changes nothing.
+            let unowed = unchanged(&mut h, |h| h.discarded(t, 2, at(9)));
             assert_eq!(unowed, repeat(Phase::Rollback));
-            assert_eq!(h, before, "a discard never owed changes nothing");
             assert_eq!(h.resumed(t, 1, at(3)), recorded(Phase::Aborted));
         }
         assert_eq!((h.active(), h.status(9)), (0, None));
@@ -176,10 +176,10 @@ fn abort_rolls_back_from_each_phase() {
 #[test]
 fn abort_after_activation_was_ordered_needs_a_newer_token() {
     let (mut h, t) = advanced(5);
-    let before = h.clone();
-    assert_eq!(h.abort(t, None, at(2)), Err(Refusal::FenceRequired));
-    assert_eq!(h.abort(t, Some(token(6)), at(2)), Err(Refusal::StaleToken));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::FenceRequired, |s| s.abort(t, None, at(2)));
+    refuses(&mut h, Refusal::StaleToken, |s| {
+        s.abort(t, Some(token(6)), at(2))
+    });
     assert_eq!(h.abort(t, Some(token(7)), at(2)), recorded(Phase::Rollback));
     let resume = Action::Resume {
         token: Some(token(7)),
@@ -210,7 +210,6 @@ fn stale_generation_acknowledgements_are_refused() {
     h.resumed(old, 1, at(0)).unwrap();
     let new = h.start(9, 1, 2, 10, token(5), at(1)).unwrap();
     assert_eq!(new.generation, 2);
-    let before = h.clone();
     let forged = Ticket {
         partition: 9,
         generation: 3,
@@ -224,77 +223,85 @@ fn stale_generation_acknowledgements_are_refused() {
         (forged, Refusal::Unknown),
         (zero, Refusal::Unknown),
     ] {
-        assert_eq!(h.quiesced(ticket, 1, 12, at(1)), Err(refusal));
-        assert_eq!(h.drained(ticket, 1, 10, at(1)), Err(refusal));
-        assert_eq!(h.committed(ticket, 1, 11, at(1)), Err(refusal));
-        assert_eq!(h.captured(ticket, 1, 7, at(1)), Err(refusal));
-        assert_eq!(h.installed(ticket, 2, 7, at(1)), Err(refusal));
-        assert_eq!(h.fenced(ticket, token(6), at(1)), Err(refusal));
-        assert_eq!(h.activated(ticket, 2, token(6), at(1)), Err(refusal));
-        assert_eq!(h.abort(ticket, None, at(1)), Err(refusal));
-        assert_eq!(h.resumed(ticket, 1, at(1)), Err(refusal));
-        assert_eq!(h.discarded(ticket, 2, at(1)), Err(refusal));
-        assert_eq!(h.outstanding(ticket, 0).err(), Some(refusal));
+        refuses(&mut h, refusal, |s| s.quiesced(ticket, 1, 12, at(1)));
+        refuses(&mut h, refusal, |s| s.drained(ticket, 1, 10, at(1)));
+        refuses(&mut h, refusal, |s| s.committed(ticket, 1, 11, at(1)));
+        refuses(&mut h, refusal, |s| s.captured(ticket, 1, 7, at(1)));
+        refuses(&mut h, refusal, |s| s.installed(ticket, 2, 7, at(1)));
+        refuses(&mut h, refusal, |s| s.fenced(ticket, token(6), at(1)));
+        refuses(&mut h, refusal, |s| s.activated(ticket, 2, token(6), at(1)));
+        refuses(&mut h, refusal, |s| s.abort(ticket, None, at(1)));
+        refuses(&mut h, refusal, |s| s.resumed(ticket, 1, at(1)));
+        refuses(&mut h, refusal, |s| s.discarded(ticket, 2, at(1)));
+        refuses(&mut h, refusal, |s| s.outstanding(ticket, 0).map(drop));
     }
-    assert_eq!(h, before);
     assert_eq!(h.quiesced(new, 1, 12, at(1)), recorded(Phase::Drain));
 }
 
 #[test]
 fn acknowledgements_must_match_phase_replica_and_evidence() {
     let (mut h, t) = begun();
-    let before = h.clone();
-    assert_eq!(h.quiesced(t, 2, 12, at(0)), Err(Refusal::WrongReplica));
-    assert_eq!(h.drained(t, 1, 10, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.committed(t, 1, 11, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.captured(t, 1, 7, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.installed(t, 2, 7, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.fenced(t, token(6), at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.activated(t, 2, token(6), at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.resumed(t, 1, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h.discarded(t, 2, at(0)), Err(Refusal::OutOfPhase));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::WrongReplica, |s| {
+        s.quiesced(t, 2, 12, at(0))
+    });
+    refuses(&mut h, Refusal::OutOfPhase, |s| s.drained(t, 1, 10, at(0)));
+    refuses(&mut h, Refusal::OutOfPhase, |s| {
+        s.committed(t, 1, 11, at(0))
+    });
+    refuses(&mut h, Refusal::OutOfPhase, |s| s.captured(t, 1, 7, at(0)));
+    refuses(&mut h, Refusal::OutOfPhase, |s| s.installed(t, 2, 7, at(0)));
+    refuses(&mut h, Refusal::OutOfPhase, |s| {
+        s.fenced(t, token(6), at(0))
+    });
+    refuses(&mut h, Refusal::OutOfPhase, |s| {
+        s.activated(t, 2, token(6), at(0))
+    });
+    refuses(&mut h, Refusal::OutOfPhase, |s| s.resumed(t, 1, at(0)));
+    refuses(&mut h, Refusal::OutOfPhase, |s| s.discarded(t, 2, at(0)));
 
     let (mut h, t) = advanced(1);
-    let before = h.clone();
-    assert_eq!(h.drained(t, 2, 10, at(1)), Err(Refusal::WrongReplica));
-    assert_eq!(h.drained(t, 1, 12, at(1)), Err(Refusal::BeyondDrain));
-    let below = h.drained(t, 1, 9, at(7));
+    // Refusals and repeats change nothing.
+    refuses(&mut h, Refusal::WrongReplica, |h| {
+        h.drained(t, 2, 10, at(1))
+    });
+    refuses(&mut h, Refusal::BeyondDrain, |h| h.drained(t, 1, 12, at(1)));
+    let below = unchanged(&mut h, |h| h.drained(t, 1, 9, at(7)));
     assert_eq!(below, repeat(Phase::Drain), "below the base");
-    assert_eq!(h.committed(t, 2, 11, at(1)), Err(Refusal::WrongReplica));
-    assert_eq!(h.committed(t, 1, 11, at(1)), Err(Refusal::Unacked));
-    let settled = h.committed(t, 1, 10, at(7));
+    refuses(&mut h, Refusal::WrongReplica, |h| {
+        h.committed(t, 2, 11, at(1))
+    });
+    refuses(&mut h, Refusal::Unacked, |h| h.committed(t, 1, 11, at(1)));
+    let settled = unchanged(&mut h, |h| h.committed(t, 1, 10, at(7)));
     assert_eq!(settled, repeat(Phase::Drain));
-    assert_eq!(h, before, "refusals and repeats change nothing");
     assert_eq!(h.drained(t, 1, 10, at(1)), recorded(Phase::Drain));
-    let before = h.clone();
-    let again = h.drained(t, 1, 10, at(7));
+    // A repeat changes nothing, not even the clock.
+    let again = unchanged(&mut h, |h| h.drained(t, 1, 10, at(7)));
     assert_eq!(again, repeat(Phase::Drain));
     assert!(again.is_ok_and(Acked::is_duplicate));
     assert_eq!(again.map(Acked::phase), Ok(Phase::Drain));
-    assert_eq!(h, before, "a repeat changes nothing, not even the clock");
 
     let (mut h, t) = advanced(2);
     assert_eq!(h.captured(t, 2, 77, at(1)), Err(Refusal::WrongReplica));
     let (mut h, t) = advanced(3);
-    let before = h.clone();
-    assert_eq!(h.installed(t, 1, 77, at(1)), Err(Refusal::WrongReplica));
-    assert_eq!(h.installed(t, 2, 78, at(1)), Err(Refusal::Mismatch));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::WrongReplica, |s| {
+        s.installed(t, 1, 77, at(1))
+    });
+    refuses(&mut h, Refusal::Mismatch, |s| s.installed(t, 2, 78, at(1)));
     let (mut h, t) = advanced(4);
-    let before = h.clone();
-    assert_eq!(h.fenced(t, token(5), at(1)), Err(Refusal::StaleToken));
-    assert_eq!(h.fenced(t, token(4), at(1)), Err(Refusal::StaleToken));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::StaleToken, |s| {
+        s.fenced(t, token(5), at(1))
+    });
+    refuses(&mut h, Refusal::StaleToken, |s| {
+        s.fenced(t, token(4), at(1))
+    });
     let (mut h, t) = advanced(5);
-    let before = h.clone();
-    assert_eq!(
-        h.activated(t, 1, token(6), at(1)),
-        Err(Refusal::WrongReplica)
-    );
-    assert_eq!(h.activated(t, 2, token(7), at(1)), Err(Refusal::Mismatch));
-    assert_eq!(h.fenced(t, token(8), at(1)), Err(Refusal::Mismatch));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::WrongReplica, |s| {
+        s.activated(t, 1, token(6), at(1))
+    });
+    refuses(&mut h, Refusal::Mismatch, |s| {
+        s.activated(t, 2, token(7), at(1))
+    });
+    refuses(&mut h, Refusal::Mismatch, |s| s.fenced(t, token(8), at(1)));
 }
 
 #[test]
@@ -308,9 +315,9 @@ fn concurrent_transfers_are_bounded_by_slots_and_per_replica() {
     );
     let b = h.start(2, 2, 1, 0, token(1), at(0)).unwrap();
     assert_eq!((a.generation, b.generation, h.active()), (1, 2, 2));
-    let before = h.clone();
-    assert_eq!(h.start(3, 7, 8, 0, token(1), at(0)), Err(Refusal::Full));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::Full, |s| {
+        s.start(3, 7, 8, 0, token(1), at(0))
+    });
     h.abort(a, None, at(0)).unwrap();
     assert_eq!(h.start(3, 7, 8, 0, token(1), at(0)), Err(Refusal::Full));
     h.resumed(a, 1, at(0)).unwrap();
@@ -320,16 +327,12 @@ fn concurrent_transfers_are_bounded_by_slots_and_per_replica() {
     let mut wide = Handoff::<4, 1>::new(LIMITS);
     wide.start(1, 1, 2, 0, token(1), at(0)).unwrap();
     wide.start(2, 3, 1, 0, token(1), at(0)).unwrap();
-    let before = wide.clone();
-    assert_eq!(
-        wide.start(3, 1, 4, 0, token(1), at(0)),
-        Err(Refusal::ReplicaBusy)
-    );
-    assert_eq!(
-        wide.start(3, 4, 1, 0, token(1), at(0)),
-        Err(Refusal::ReplicaBusy)
-    );
-    assert_eq!(wide, before);
+    refuses(&mut wide, Refusal::ReplicaBusy, |s| {
+        s.start(3, 1, 4, 0, token(1), at(0))
+    });
+    refuses(&mut wide, Refusal::ReplicaBusy, |s| {
+        s.start(3, 4, 1, 0, token(1), at(0))
+    });
     assert!(wide.start(3, 2, 3, 0, token(1), at(0)).is_ok());
 
     let mut none = Handoff::<0, 1>::new(LIMITS);

@@ -46,9 +46,10 @@ class ValuesTest < Minitest::Test
   end
 
   def test_actions_and_recipients
-    [[H::Replica, -1], [H::Drain, 2**64], [H::Capture, -1], [H::Install, 2**64]].each do |klass, bad|
-      assert_raises(RangeError) { klass.new(bad) }
-      assert_raises(TypeError) { klass.new(1.0) }
+    [[H::Replica, -1, 'id'], [H::Drain, 2**64, 'until'], [H::Capture, -1, 'at'],
+     [H::Install, 2**64, 'checkpoint']].each do |klass, bad, field|
+      assert_equal "#{field} must be in 0..=18446744073709551615", assert_raises(RangeError) { klass.new(bad) }.message
+      assert_equal "#{field} must be an Integer", assert_raises(TypeError) { klass.new(1.0) }.message
       assert_raises(ArgumentError) { klass.new }
     end
     assert_equal 12, H::Drain.new(until: 12).until

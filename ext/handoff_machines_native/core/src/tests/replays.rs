@@ -7,10 +7,9 @@ type Call<'a> = &'a dyn Fn(&mut Small) -> Answer;
 
 /// Every call must leave the coordinator exactly as it was, clock included.
 fn unchanged(h: &mut Small, calls: &[(Call, Answer)]) {
-    let before = h.clone();
     for (index, (call, expected)) in calls.iter().enumerate() {
-        assert_eq!(call(h), *expected, "call {index}");
-        assert_eq!(*h, before, "call {index} changed something");
+        let answer = matryona_machines::testing::unchanged(h, |h| call(h));
+        assert_eq!(answer, *expected, "call {index}");
     }
 }
 

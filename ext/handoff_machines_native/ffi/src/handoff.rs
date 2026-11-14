@@ -1,18 +1,47 @@
 //! `HandoffMachines::Handoff`: the coordinator.
 use std::cell::RefCell;
 
-use handoff_machines::{Acked, FencingToken, Refusal};
-use magnus::{Error, IntoValue, RArray, Ruby, Value, prelude::*, typed_data::Obj};
+use std::time::Duration;
 
-use crate::classes::{classes, keep};
-use crate::values::{LimitsValue, TicketValue, TokenValue};
-use crate::{Core, Number, Scope, names};
+use handoff_machines::{Acked, FencingToken, Refusal, Ticket};
+use magnus::{Error, Integer, IntoValue, RArray, Ruby, Value, prelude::*, typed_data::Obj};
+use matryona_machines::ruby::{Symbols, duration, integer, keep, nanoseconds};
+
+use crate::classes::classes;
+use crate::values;
+use crate::{Core, names};
 
 type Outcome = Result<Acked, Refusal>;
 
+/// A ticket, a replica and an offset or checkpoint, converted in that order.
+fn report(
+    ruby: &Ruby,
+    (ticket, replica, value, now): (Value, Value, Value, Value),
+    name: &str,
+) -> Result<(Ticket, u64, u64, Duration), Error> {
+    let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
+    Ok((
+        ticket,
+        replica,
+        integer(value, name)?,
+        duration(now, "now")?,
+    ))
+}
+
+/// A ticket, a replica and a `now`, converted in that order.
+fn settle(
+    ruby: &Ruby,
+    ticket: Value,
+    replica: Value,
+    now: Value,
+) -> Result<(Ticket, u64, Duration), Error> {
+    let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
+    Ok((ticket, replica, duration(now, "now")?))
+}
+
 /// A refusal's symbol.
 fn refused(ruby: &Ruby, refusal: Refusal) -> Value {
-    ruby.to_symbol(names::refusal(refusal)).as_value()
+    names::Refusals::symbol(ruby, refusal).as_value()
 }
 
 /// A `Recorded` or `Duplicate` when honoured, built by its `new`, or the
@@ -24,8 +53,8 @@ fn acked(ruby: &Ruby, outcome: Outcome) -> Result<Value, Error> {
         Ok(Acked::Duplicate(stands)) => (classes.duplicate, stands),
         Err(refusal) => return Ok(refused(ruby, refusal)),
     };
-    let phase = ruby.to_symbol(names::phase(phase));
-    ruby.get_inner(class).funcall("new", (phase,))
+    let phase = names::Phases::symbol(ruby, phase);
+    class.get(ruby).funcall("new", (phase,))
 }
 
 #[magnus::wrap(class = "HandoffMachines::Handoff", free_immediately, size)]
@@ -34,19 +63,22 @@ pub struct Handoff {
 }
 
 impl Handoff {
-    pub const fn with_scope(limits: LimitsValue, scope: Scope) -> Self {
-        Self {
-            core: RefCell::new(Core::with_scope(limits.0, scope.0)),
-        }
+    pub fn with_scope(ruby: &Ruby, limits: Value, scope: Value) -> Result<Self, Error> {
+        let (limits, scope) = (values::limits(ruby, limits)?, integer(scope, "scope")?);
+        Ok(Self {
+            core: RefCell::new(Core::with_scope(limits, scope)),
+        })
     }
 
     pub fn restored(
         ruby: &Ruby,
-        limits: LimitsValue,
-        scope: Scope,
-        last_generation: Number,
+        limits: Value,
+        scope: Value,
+        last_generation: Value,
     ) -> Result<Self, Error> {
-        Core::restored(limits.0, scope.0, last_generation.0)
+        let (limits, scope) = (values::limits(ruby, limits)?, integer(scope, "scope")?);
+        let last_generation = integer(last_generation, "last_generation")?;
+        Core::restored(limits, scope, last_generation)
             .map(|core| Self {
                 core: RefCell::new(core),
             })
@@ -62,9 +94,12 @@ impl Handoff {
         self.core.borrow().scope()
     }
 
-    pub fn limits(&self) -> (u128, usize) {
-        let limits = self.core.borrow().limits();
-        (limits.phase_budget().as_nanos(), limits.per_replica())
+    pub fn limits(ruby: &Ruby, this: &Self) -> (Integer, usize) {
+        let limits = this.core.borrow().limits();
+        (
+            nanoseconds(ruby, limits.phase_budget()),
+            limits.per_replica(),
+        )
     }
 
     /// A `Ticket` when honoured, built by its `new` while the decision is
@@ -73,28 +108,29 @@ impl Handoff {
     pub fn start(
         ruby: &Ruby,
         this: Obj<Self>,
-        partition: Number,
-        source: Number,
-        target: Number,
-        base: Number,
-        source_token: TokenValue,
-        now: Number,
+        partition: Value,
+        source: Value,
+        target: Value,
+        base: Value,
+        source_token: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let class = classes(ruby)?.ticket;
-        let held = source_token.0;
-        let start =
-            |core: &mut Core| core.start(partition.0, source.0, target.0, base.0, held, now.at());
+        this.check_frozen()?;
+        let (partition, source) = (integer(partition, "partition")?, integer(source, "source")?);
+        let (target, base) = (integer(target, "target")?, integer(base, "base")?);
+        let held = values::token(ruby, source_token)?;
+        let now = duration(now, "now")?;
+        let class = classes(ruby)?.ticket.get(ruby);
+        let start = |core: &mut Core| core.start(partition, source, target, base, held, now);
         keep(ruby, this, &this.core, start, |started| match started {
-            Ok(ticket) => ruby
-                .get_inner(class)
-                .funcall("new", (ticket.partition(), ticket.generation())),
+            Ok(ticket) => class.funcall("new", (ticket.partition(), ticket.generation())),
             Err(refusal) => Ok(refused(ruby, refusal)),
         })
     }
 
-    /// Every acknowledgement. Everything that can raise happens before the
-    /// core is called; the answer is built while the decision is held on a
-    /// copy, kept only once it exists (clone-then-keep).
+    /// Every acknowledgement. Frozen is checked and everything that can raise
+    /// happens before the core is called; the answer is built while the
+    /// decision is held on a copy, kept only once it exists (clone-then-keep).
     fn ack(
         ruby: &Ruby,
         this: Obj<Self>,
@@ -106,163 +142,182 @@ impl Handoff {
     pub fn quiesced(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        until: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        until: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
+        this.check_frozen()?;
+        let (ticket, replica, until, now) = report(ruby, (ticket, replica, until, now), "until")?;
         Self::ack(ruby, this, |core| {
-            core.quiesced(ticket, replica.0, until.0, now.at())
+            core.quiesced(ticket, replica, until, now)
         })
     }
 
     pub fn drained(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        offset: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        offset: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
+        this.check_frozen()?;
+        let (ticket, replica, offset, now) =
+            report(ruby, (ticket, replica, offset, now), "offset")?;
         Self::ack(ruby, this, |core| {
-            core.drained(ticket, replica.0, offset.0, now.at())
+            core.drained(ticket, replica, offset, now)
         })
     }
 
     pub fn committed(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        offset: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        offset: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
+        this.check_frozen()?;
+        let (ticket, replica, offset, now) =
+            report(ruby, (ticket, replica, offset, now), "offset")?;
         Self::ack(ruby, this, |core| {
-            core.committed(ticket, replica.0, offset.0, now.at())
+            core.committed(ticket, replica, offset, now)
         })
     }
 
     pub fn captured(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        checkpoint: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        checkpoint: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
+        this.check_frozen()?;
+        let fields = (ticket, replica, checkpoint, now);
+        let (ticket, replica, checkpoint, now) = report(ruby, fields, "checkpoint")?;
         Self::ack(ruby, this, |core| {
-            core.captured(ticket, replica.0, checkpoint.0, now.at())
+            core.captured(ticket, replica, checkpoint, now)
         })
     }
 
     pub fn installed(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        checkpoint: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        checkpoint: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
+        this.check_frozen()?;
+        let fields = (ticket, replica, checkpoint, now);
+        let (ticket, replica, checkpoint, now) = report(ruby, fields, "checkpoint")?;
         Self::ack(ruby, this, |core| {
-            core.installed(ticket, replica.0, checkpoint.0, now.at())
+            core.installed(ticket, replica, checkpoint, now)
         })
     }
 
     pub fn fenced(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        token: TokenValue,
-        now: Number,
+        ticket: Value,
+        token: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let (ticket, token) = (ticket.0, token.0);
-        Self::ack(ruby, this, |core| core.fenced(ticket, token, now.at()))
+        this.check_frozen()?;
+        let (ticket, token) = (values::ticket(ruby, ticket)?, values::token(ruby, token)?);
+        let now = duration(now, "now")?;
+        Self::ack(ruby, this, |core| core.fenced(ticket, token, now))
     }
 
     pub fn activated(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        token: TokenValue,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        token: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let (ticket, token) = (ticket.0, token.0);
+        this.check_frozen()?;
+        let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
+        let (token, now) = (values::token(ruby, token)?, duration(now, "now")?);
         Self::ack(ruby, this, |core| {
-            core.activated(ticket, replica.0, token, now.at())
+            core.activated(ticket, replica, token, now)
         })
     }
 
     pub fn abort(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        token: Option<TokenValue>,
-        now: Number,
+        ticket: Value,
+        token: Option<Value>,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
-        let token = token.map(|token| token.0);
-        Self::ack(ruby, this, |core| core.abort(ticket, token, now.at()))
+        this.check_frozen()?;
+        let ticket = values::ticket(ruby, ticket)?;
+        let token = token.map(|token| values::token(ruby, token)).transpose()?;
+        let now = duration(now, "now")?;
+        Self::ack(ruby, this, |core| core.abort(ticket, token, now))
     }
 
     pub fn resumed(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
-        Self::ack(ruby, this, |core| core.resumed(ticket, replica.0, now.at()))
+        this.check_frozen()?;
+        let (ticket, replica, now) = settle(ruby, ticket, replica, now)?;
+        Self::ack(ruby, this, |core| core.resumed(ticket, replica, now))
     }
 
     pub fn discarded(
         ruby: &Ruby,
         this: Obj<Self>,
-        ticket: TicketValue,
-        replica: Number,
-        now: Number,
+        ticket: Value,
+        replica: Value,
+        now: Value,
     ) -> Result<Value, Error> {
-        let ticket = ticket.0;
-        Self::ack(ruby, this, |core| {
-            core.discarded(ticket, replica.0, now.at())
-        })
+        this.check_frozen()?;
+        let (ticket, replica, now) = settle(ruby, ticket, replica, now)?;
+        Self::ack(ruby, this, |core| core.discarded(ticket, replica, now))
     }
 
-    pub fn status(ruby: &Ruby, this: &Self, partition: Number) -> Option<Value> {
-        let status = this.core.borrow().status(partition.0)?;
+    pub fn status(ruby: &Ruby, this: &Self, partition: Value) -> Result<Option<Value>, Error> {
+        let partition = integer(partition, "partition")?;
+        let Some(status) = this.core.borrow().status(partition) else {
+            return Ok(None);
+        };
         let head = (
             status.ticket().partition(),
             status.ticket().generation(),
             status.source(),
             status.target(),
-            ruby.to_symbol(names::phase(status.phase())),
+            names::Phases::symbol(ruby, status.phase()),
         );
         let tail = (
             status.base(),
             status.until(),
             status.checkpoint(),
             status.token().map(FencingToken::raw),
-            status.deadline().as_nanos(),
+            nanoseconds(ruby, status.deadline()),
         );
-        Some((head, tail).into_value_with(ruby))
+        Ok(Some((head, tail).into_value_with(ruby)))
     }
 
     pub fn orders(
         ruby: &Ruby,
         this: &Self,
-        from: Number,
-        limit: Number,
+        from: Value,
+        limit: Value,
     ) -> Result<(RArray, usize), Error> {
+        let (from, limit) = (integer(from, "from")?, integer(limit, "limit")?);
         let core = this.core.borrow();
-        let mut pass = core.orders(from.index(ruby)?);
+        let mut pass = core.orders(from);
         let list = ruby.ary_new();
-        for order in pass.by_ref().take(limit.index(ruby)?) {
+        for order in pass.by_ref().take(limit) {
             let (to, action, value) = names::order(ruby, &order);
             let ticket = order.ticket();
             list.push((ticket.partition(), ticket.generation(), to, action, value))?;
@@ -273,13 +328,14 @@ impl Handoff {
     pub fn outstanding(
         ruby: &Ruby,
         this: &Self,
-        ticket: TicketValue,
-        from: Number,
-        limit: Number,
+        ticket: Value,
+        from: Value,
+        limit: Value,
     ) -> Result<Value, Error> {
+        let (ticket, from) = (values::ticket(ruby, ticket)?, integer(from, "from")?);
+        let limit: usize = integer(limit, "limit")?;
         let core = this.core.borrow();
-        let limit = limit.index(ruby)?;
-        Ok(match core.outstanding(ticket.0, from.0) {
+        Ok(match core.outstanding(ticket, from) {
             Ok(missing) => {
                 let list = ruby.ary_new();
                 for offset in missing.take(limit) {
@@ -287,21 +343,23 @@ impl Handoff {
                 }
                 list.as_value()
             }
-            Err(refusal) => ruby.to_symbol(names::refusal(refusal)).as_value(),
+            Err(refusal) => refused(ruby, refusal),
         })
     }
 
     pub fn overdue(
         ruby: &Ruby,
         this: &Self,
-        now: Number,
-        from: Number,
-        limit: Number,
+        now: Value,
+        from: Value,
+        limit: Value,
     ) -> Result<(RArray, usize), Error> {
+        let (now, from) = (duration(now, "now")?, integer(from, "from")?);
+        let limit = integer(limit, "limit")?;
         let core = this.core.borrow();
-        let mut pass = core.overdue(now.at(), from.index(ruby)?);
+        let mut pass = core.overdue(now, from);
         let list = ruby.ary_new();
-        for ticket in pass.by_ref().take(limit.index(ruby)?) {
+        for ticket in pass.by_ref().take(limit) {
             list.push((ticket.partition(), ticket.generation()))?;
         }
         Ok((list, pass.position()))

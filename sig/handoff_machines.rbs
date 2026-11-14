@@ -276,7 +276,10 @@ module HandoffMachines
   def self.__ticket: (Integer, Integer) -> nil
   def self.__recorded: (phase) -> nil
   def self.__duplicate: (phase) -> nil
-  def self.__u64: (Integer) -> nil
+  def self.__replica: (Integer) -> nil
+  def self.__drain: (Integer) -> nil
+  def self.__capture: (Integer) -> nil
+  def self.__install: (Integer) -> nil
   def self.__token: (_FencingToken) -> FencingToken
   def self.__order: (Ticket, recipient, action) -> nil
   def self.__status: (Ticket, Integer, Integer, phase, Integer, Integer?, Integer?, _FencingToken?, Integer)

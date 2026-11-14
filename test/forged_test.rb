@@ -101,4 +101,26 @@ class ForgedTest < Minitest::Test
     assert_equal H::Recorded.new(:drain), handoff.quiesced(ticket, 1, 12, 1)
     assert_instance_of H::Handoff, H::Handoff.new(H::Limits.new(1, 1).tap(&:singleton_class))
   end
+
+  # This gem's values are read from the struct, never through their readers:
+  # a redefined reader is ignored (a sibling's token is still read by its).
+  def test_a_redefined_reader_is_ignored
+    handoff, ticket = begun
+    order = H::Order.new(ticket, H::Replica.new(1), H::Drain.new(12))
+    readers = { H::FencingToken => %i[raw], H::Limits => %i[phase_budget per_replica],
+                H::Ticket => %i[partition generation], H::Replica => %i[id], H::Drain => %i[until] }
+    originals = readers.flat_map { |klass, names| names.map { [klass, it, klass.instance_method(it)] } }
+    begin
+      originals.each { |klass, name, _| klass.define_method(name) { raise "#{name} reader ran" } }
+      quiesced = handoff.quiesced(ticket, 1, 12, 1)
+      other = H::Handoff.new(LIMITS)
+      started = other.start(9, 1, 2, 10, tok(5), 0)
+      rebuilt = H::Order.new(order.ticket, order.to, order.action)
+    ensure
+      originals.each { |klass, name, reader| klass.define_method(name, reader) }
+    end
+    assert_equal H::Recorded.new(:drain), quiesced
+    assert_equal ticket, started
+    assert_equal order, rebuilt
+  end
 end

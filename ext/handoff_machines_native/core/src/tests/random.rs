@@ -1,7 +1,7 @@
 //! Randomized comparison of the core against the naive model.
 use std::{collections::BTreeSet, format, string::String, vec::Vec};
 
-use super::draws::{Draws, fencing, sorted};
+use super::draws::{Draws, chance, fencing, sorted};
 use super::model::{Model, Wait};
 use super::{LIMITS, token};
 use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Status, Ticket};
@@ -48,7 +48,7 @@ impl Run {
                 capacity: N,
                 window: 64,
             },
-            draws: Draws(seed),
+            draws: Draws::new(seed),
             home: scope.wrapping_add(0x0203),
             now: Duration::ZERO,
             tickets: Vec::new(),
@@ -57,12 +57,12 @@ impl Run {
     }
 
     fn clock(&mut self) -> Duration {
-        if self.draws.chance(4) {
+        if chance(&mut self.draws, 4) {
             return self
                 .now
                 .saturating_sub(Duration::from_secs(1 + self.draws.below(3)));
         }
-        if self.draws.chance(40) {
+        if chance(&mut self.draws, 40) {
             self.now += Duration::from_secs(self.draws.below(4));
         }
         self.now
@@ -72,7 +72,7 @@ impl Run {
     /// sequence number as another scope would have issued it.
     fn ticket(&mut self) -> Ticket {
         let ticket = self.own_ticket();
-        if !self.draws.chance(8) {
+        if !chance(&mut self.draws, 8) {
             return ticket;
         }
         Ticket {
@@ -100,13 +100,13 @@ impl Run {
     fn step(&mut self) {
         let now = self.clock();
         let before = self.core.clone();
-        if self.draws.chance(12) {
+        if chance(&mut self.draws, 12) {
             let (p, s, t) = (
                 self.draws.below(6),
                 self.draws.below(5),
                 self.draws.below(5),
             );
-            let base = if self.draws.chance(10) {
+            let base = if chance(&mut self.draws, 10) {
                 u64::MAX - self.draws.below(40)
             } else {
                 self.draws.below(10)
@@ -150,13 +150,13 @@ impl Run {
         let (source, target, base) = entry
             .as_ref()
             .map_or((0, 1, 0), |m| (m.source, m.target, m.base));
-        let honest = !self.draws.chance(12);
-        let by = |d: &mut Draws, holder: u64| if d.chance(92) { holder } else { d.below(5) };
+        let honest = !chance(&mut self.draws, 12);
+        let by = |d: &mut Draws, holder: u64| if chance(d, 92) { holder } else { d.below(5) };
         let wait = entry.as_ref().map(|m| m.wait);
         let choice = match wait {
             Some(Wait::Quiesce) if honest => 0,
             Some(Wait::Drain) if honest => {
-                1 + self.draws.below(8).min(1) * u64::from(self.draws.chance(15))
+                1 + self.draws.below(8).min(1) * u64::from(chance(&mut self.draws, 15))
             }
             Some(Wait::Capture) if honest => 3,
             Some(Wait::Install) if honest => 4,
@@ -165,20 +165,24 @@ impl Run {
             Some(Wait::Undo) if honest => 8 + self.draws.below(2),
             _ => self.draws.below(10),
         };
-        let choice = if self.draws.chance(5) { 7 } else { choice };
+        let choice = if chance(&mut self.draws, 5) {
+            7
+        } else {
+            choice
+        };
         let (core, model, d) = (&mut self.core, &mut self.model, &mut self.draws);
         let home = self.home;
         let granted = entry.as_ref().and_then(|m| m.granted);
         let granted = granted.map(|raw| sequence_of(raw) - 1);
         let mut offered = None;
         let near = |d: &mut Draws, value: Option<u64>| match value {
-            Some(value) if d.chance(92) => value,
+            Some(value) if chance(d, 92) => value,
             _ => d.below(9),
         };
         let (got, expected) = match choice {
             0 => {
                 let until = match said {
-                    Some(said) if d.chance(70) => said,
+                    Some(said) if chance(d, 70) => said,
                     _ => base
                         .saturating_add(d.below(90))
                         .saturating_sub(d.below(2) * d.below(2)),
@@ -192,8 +196,8 @@ impl Run {
             1 => {
                 let missing = entry.as_ref().map_or_default(|m| m.missing(0));
                 let offset = match missing.len() as u64 {
-                    count if count > 0 && d.chance(90) => {
-                        let reach = if d.chance(80) { count.min(3) } else { count };
+                    count if count > 0 && chance(d, 90) => {
+                        let reach = if chance(d, 80) { count.min(3) } else { count };
                         missing[usize::try_from(d.below(reach)).unwrap()]
                     }
                     _ => base.saturating_add(d.below(100)).saturating_sub(d.below(3)),
@@ -249,8 +253,8 @@ impl Run {
             }
             7 => {
                 let fence = match undo {
-                    Some(_) if d.chance(60) => undo,
-                    _ => d.chance(50).then(|| fencing(1 + d.below(12), home, d)),
+                    Some(_) if chance(d, 60) => undo,
+                    _ => chance(d, 50).then(|| fencing(1 + d.below(12), home, d)),
                 };
                 offered = fence;
                 (

@@ -47,6 +47,25 @@ class KeepTest < Minitest::Test
     assert_raises(FrozenError) { @handoff.quiesced(@ticket, 1, 12, 1) }
   end
 
+  # Frozen is checked before any argument is read: a frozen coordinator
+  # handed a malformed argument raises FrozenError, as Ruby's own core
+  # methods do.
+  def test_frozen_is_checked_before_the_arguments
+    @handoff.freeze
+    assert_raises(FrozenError) { @handoff.start(1.5, 3, 4, 0, tok(1), 1) }
+    assert_raises(FrozenError) { @handoff.start(3, 3, 4, 0, :token, 1) }
+    assert_raises(FrozenError) { @handoff.quiesced(nil, 1, 12, 1) }
+    assert_raises(FrozenError) { @handoff.drained(@ticket, -1, 12, 1) }
+    assert_raises(FrozenError) { @handoff.committed(@ticket, 1, '12', 1) }
+    assert_raises(FrozenError) { @handoff.captured(@ticket, 1, 7, nil) }
+    assert_raises(FrozenError) { @handoff.installed(@ticket, 2, 2**64, 1) }
+    assert_raises(FrozenError) { @handoff.fenced(@ticket, 6, 1) }
+    assert_raises(FrozenError) { @handoff.activated(@ticket, 2, nil, 1) }
+    assert_raises(FrozenError) { @handoff.abort(@ticket, :token, 1) }
+    assert_raises(FrozenError) { @handoff.resumed(Object.new, 1, 1) }
+    assert_raises(FrozenError) { @handoff.discarded(@ticket, 2, 1.0) }
+  end
+
   # The binding holds its classes by address: they are pinned, so compaction
   # moves none of them and every path that checks or builds one still works.
   def test_classes_survive_compaction

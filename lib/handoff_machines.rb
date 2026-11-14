@@ -101,7 +101,7 @@ module HandoffMachines
   # the symbol :authority.
   Replica = Data.define(:id) do
     def initialize(id:)
-      HandoffMachines.__send__(:__u64, id)
+      HandoffMachines.__send__(:__replica, id)
       super
     end
   end
@@ -113,19 +113,19 @@ module HandoffMachines
   # this gem's FencingToken.
   Drain = Data.define(:until) do
     def initialize(**field)
-      HandoffMachines.__send__(:__u64, field[:until]) if field.key?(:until)
+      HandoffMachines.__send__(:__drain, field[:until]) if field.key?(:until)
       super
     end
   end
   Capture = Data.define(:at) do
     def initialize(at:)
-      HandoffMachines.__send__(:__u64, at)
+      HandoffMachines.__send__(:__capture, at)
       super
     end
   end
   Install = Data.define(:checkpoint) do
     def initialize(checkpoint:)
-      HandoffMachines.__send__(:__u64, checkpoint)
+      HandoffMachines.__send__(:__install, checkpoint)
       super
     end
   end
@@ -190,7 +190,8 @@ require 'handoff_machines_native/handoff_machines_native'
 module HandoffMachines
   class << self
     private :native_raw, :native_token_scope, :native_token_order, :native_token_newer,
-            :__limits, :__ticket, :__recorded, :__duplicate, :__u64, :__token, :__order, :__status
+            :__limits, :__ticket, :__recorded, :__duplicate, :__replica, :__drain, :__capture, :__install,
+            :__token, :__order, :__status
   end
 
   # The core's `Handoff`. Every mutating call (start and each

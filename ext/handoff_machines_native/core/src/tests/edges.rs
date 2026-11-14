@@ -1,6 +1,8 @@
 //! Windows, clocks and integer limits.
 use std::vec::Vec;
 
+use matryona_machines::testing::refuses;
+
 use super::{LIMITS, Small, at, begun, recorded, token};
 use crate::{Duration, Handoff, Phase, Refusal};
 
@@ -39,12 +41,13 @@ fn wide_drains_slide_the_window_and_list_what_is_missing() {
 fn time_regression_is_refused_and_deadlines_are_advisory() {
     let (mut h, t) = begun();
     assert_eq!(h.quiesced(t, 1, 12, at(3)), recorded(Phase::Drain));
-    let before = h.clone();
-    assert_eq!(h.drained(t, 1, 10, at(2)), Err(Refusal::ClockRegressed));
-    assert_eq!(h.abort(t, None, at(2)), Err(Refusal::ClockRegressed));
-    let late = h.start(1, 3, 4, 0, token(1), at(2));
-    assert_eq!(late, Err(Refusal::ClockRegressed));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::ClockRegressed, |s| {
+        s.drained(t, 1, 10, at(2))
+    });
+    refuses(&mut h, Refusal::ClockRegressed, |s| s.abort(t, None, at(2)));
+    refuses(&mut h, Refusal::ClockRegressed, |s| {
+        s.start(1, 3, 4, 0, token(1), at(2))
+    });
     assert_eq!(h.status(9).unwrap().deadline, at(8));
     assert_eq!(h.overdue(at(7), 0).next(), None);
     assert_eq!(h.overdue(at(8), 0).next(), Some(t));
@@ -67,12 +70,9 @@ fn u64_limits_fail_closed() {
         .start(u64::MAX, u64::MAX, 0, u64::MAX - 2, top, at(0))
         .unwrap();
     assert_eq!((t.generation, h.generation()), (u64::MAX, u64::MAX));
-    let before = h.clone();
-    assert_eq!(
-        h.start(1, 1, 2, 0, token(1), at(0)),
-        Err(Refusal::Exhausted)
-    );
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::Exhausted, |s| {
+        s.start(1, 1, 2, 0, token(1), at(0))
+    });
     let now = Duration::MAX;
     assert_eq!(
         h.quiesced(t, u64::MAX, u64::MAX, now),

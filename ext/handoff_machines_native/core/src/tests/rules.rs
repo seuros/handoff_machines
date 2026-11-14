@@ -1,4 +1,6 @@
 //! Values valid by construction, and which honoured answers record the clock.
+use matryona_machines::testing::refuses;
+
 use super::{LIMITS, Small, advanced, at, begun, recorded, repeat, token};
 use crate::{Acked, Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
 use periscope_machines::scoped;
@@ -56,12 +58,9 @@ fn only_a_new_wait_records_the_clock() {
     let mut moved = h;
     assert_eq!(moved.quiesced(t, 1, 12, at(30)), recorded(Phase::Drain));
     assert_eq!(moved.status(9).map(|s| s.deadline), Some(at(35)));
-    let before = moved.clone();
-    assert_eq!(
-        moved.drained(t, 1, 11, at(29)),
-        Err(Refusal::ClockRegressed)
-    );
-    assert_eq!(moved, before);
+    refuses(&mut moved, Refusal::ClockRegressed, |s| {
+        s.drained(t, 1, 11, at(29))
+    });
 }
 
 #[test]

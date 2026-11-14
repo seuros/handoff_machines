@@ -1,4 +1,5 @@
 //! Every ticket carries the scope of the coordinator that issued it.
+use matryona_machines::testing::refuses;
 use periscope_machines::{SEQUENCE_MAX, scoped};
 
 use super::{LIMITS, Small, advanced_in, at, begun_in, recorded, repeat, token};
@@ -6,21 +7,19 @@ use crate::{Phase, Refusal, Ticket};
 
 /// Every call that takes a ticket answers `refusal` and changes nothing.
 fn refuses_everywhere(h: &mut Small, ticket: Ticket, refusal: Refusal) {
-    let before = h.clone();
     let now = at(9);
-    assert_eq!(h.quiesced(ticket, 1, 12, now), Err(refusal));
-    assert_eq!(h.drained(ticket, 1, 10, now), Err(refusal));
-    assert_eq!(h.committed(ticket, 1, 10, now), Err(refusal));
-    assert_eq!(h.captured(ticket, 1, 77, now), Err(refusal));
-    assert_eq!(h.installed(ticket, 2, 77, now), Err(refusal));
-    assert_eq!(h.fenced(ticket, token(6), now), Err(refusal));
-    assert_eq!(h.activated(ticket, 2, token(6), now), Err(refusal));
-    assert_eq!(h.abort(ticket, None, now), Err(refusal));
-    assert_eq!(h.abort(ticket, Some(token(9)), now), Err(refusal));
-    assert_eq!(h.resumed(ticket, 1, now), Err(refusal));
-    assert_eq!(h.discarded(ticket, 2, now), Err(refusal));
-    assert_eq!(h.outstanding(ticket, 0).err(), Some(refusal));
-    assert_eq!(*h, before);
+    refuses(h, refusal, |s| s.quiesced(ticket, 1, 12, now));
+    refuses(h, refusal, |s| s.drained(ticket, 1, 10, now));
+    refuses(h, refusal, |s| s.committed(ticket, 1, 10, now));
+    refuses(h, refusal, |s| s.captured(ticket, 1, 77, now));
+    refuses(h, refusal, |s| s.installed(ticket, 2, 77, now));
+    refuses(h, refusal, |s| s.fenced(ticket, token(6), now));
+    refuses(h, refusal, |s| s.activated(ticket, 2, token(6), now));
+    refuses(h, refusal, |s| s.abort(ticket, None, now));
+    refuses(h, refusal, |s| s.abort(ticket, Some(token(9)), now));
+    refuses(h, refusal, |s| s.resumed(ticket, 1, now));
+    refuses(h, refusal, |s| s.discarded(ticket, 2, now));
+    refuses(h, refusal, |s| s.outstanding(ticket, 0).map(drop));
 }
 
 #[test]
@@ -129,27 +128,22 @@ fn the_last_generation_is_issued_then_the_scope_is_spent() {
     assert_eq!(h.scope(), 0);
     let last = h.start(1, 1, 2, 0, token(1), at(3)).unwrap();
     assert_eq!((last.generation, last.scope()), (SEQUENCE_MAX, 0));
-    let before = h.clone();
     // Not even the instant is recorded, and scope one is not borrowed from.
-    assert_eq!(
-        h.start(2, 3, 4, 0, token(1), at(7)),
-        Err(Refusal::Exhausted)
-    );
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::Exhausted, |s| {
+        s.start(2, 3, 4, 0, token(1), at(7))
+    });
     assert_eq!((h.scope(), h.generation()), (0, SEQUENCE_MAX));
     // Another refusal comes first and still spends nothing.
-    assert_eq!(h.start(1, 3, 4, 0, token(1), at(7)), Err(Refusal::Busy));
-    assert_eq!(h, before);
+    refuses(&mut h, Refusal::Busy, |s| {
+        s.start(1, 3, 4, 0, token(1), at(7))
+    });
     // The ticket already issued still works.
     assert_eq!(h.quiesced(last, 1, 0, at(3)), recorded(Phase::Checkpoint));
 
     let mut spent = Small::restored(LIMITS, 0, SEQUENCE_MAX).unwrap();
-    let before = spent.clone();
-    assert_eq!(
-        spent.start(1, 1, 2, 0, token(1), at(0)),
-        Err(Refusal::Exhausted)
-    );
-    assert_eq!(spent, before);
+    refuses(&mut spent, Refusal::Exhausted, |s| {
+        s.start(1, 1, 2, 0, token(1), at(0))
+    });
 }
 
 #[test]
@@ -194,12 +188,9 @@ fn the_last_generation_of_a_scope_restores_a_spent_coordinator() {
     assert_eq!((last.generation, h.generation()), (u64::MAX, u64::MAX));
     let mut spent = Small::restored(LIMITS, u16::MAX, h.generation()).unwrap();
     assert_eq!((spent.scope(), spent.generation()), (u16::MAX, u64::MAX));
-    let before = spent.clone();
-    assert_eq!(
-        spent.start(2, 3, 4, 0, token(1), at(7)),
-        Err(Refusal::Exhausted)
-    );
-    assert_eq!(spent, before);
+    refuses(&mut spent, Refusal::Exhausted, |s| {
+        s.start(2, 3, 4, 0, token(1), at(7))
+    });
     refuses_everywhere(&mut spent, last, Refusal::Stale);
 }
 

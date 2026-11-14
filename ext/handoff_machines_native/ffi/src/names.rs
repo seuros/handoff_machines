@@ -1,84 +1,42 @@
 //! Symbol names for the core's phases, refusals and orders.
 use handoff_machines::{Action, FencingToken, Order, Phase, Recipient, Refusal};
 use magnus::{IntoValue, Ruby, Symbol, Value, prelude::*};
+use matryona_machines::ruby::symbol;
 
-pub const PHASES: [&str; 7] = [
-    "quiesce",
-    "drain",
-    "checkpoint",
-    "activate",
-    "rollback",
-    "complete",
-    "aborted",
-];
-
-pub const REFUSALS: [&str; 17] = [
-    "full",
-    "busy",
-    "replica_busy",
-    "same_replica",
-    "exhausted",
-    "clock_regressed",
-    "stale",
-    "unknown",
-    "out_of_phase",
-    "wrong_replica",
-    "behind_base",
-    "beyond_drain",
-    "out_of_window",
-    "unacked",
-    "mismatch",
-    "stale_token",
-    "fence_required",
-];
-
-/// Every phase, in the order of [`PHASES`].
-const ALL: [Phase; 7] = [
-    Phase::Quiesce,
-    Phase::Drain,
-    Phase::Checkpoint,
-    Phase::Activate,
-    Phase::Rollback,
-    Phase::Complete,
-    Phase::Aborted,
-];
-
-/// The phase a symbol name names, if any.
-pub fn phase_named(name: &str) -> Option<Phase> {
-    ALL.into_iter().find(|candidate| phase(*candidate) == name)
-}
-
-pub const fn phase(phase: Phase) -> &'static str {
-    match phase {
-        Phase::Quiesce => "quiesce",
-        Phase::Drain => "drain",
-        Phase::Checkpoint => "checkpoint",
-        Phase::Activate => "activate",
-        Phase::Rollback => "rollback",
-        Phase::Complete => "complete",
-        Phase::Aborted => "aborted",
+matryona_machines::symbols! {
+    /// The core's phases as Symbols: `TypeError` for a non-Symbol,
+    /// `RangeError` for a Symbol that names no phase.
+    pub Phases for Phase as "phase" {
+        Quiesce => "quiesce",
+        Drain => "drain",
+        Checkpoint => "checkpoint",
+        Activate => "activate",
+        Rollback => "rollback",
+        Complete => "complete",
+        Aborted => "aborted",
     }
 }
 
-pub const fn refusal(refusal: Refusal) -> &'static str {
-    match refusal {
-        Refusal::Full => "full",
-        Refusal::Busy => "busy",
-        Refusal::ReplicaBusy => "replica_busy",
-        Refusal::SameReplica => "same_replica",
-        Refusal::Exhausted => "exhausted",
-        Refusal::ClockRegressed => "clock_regressed",
-        Refusal::Stale => "stale",
-        Refusal::Unknown => "unknown",
-        Refusal::OutOfPhase => "out_of_phase",
-        Refusal::WrongReplica => "wrong_replica",
-        Refusal::BehindBase => "behind_base",
-        Refusal::BeyondDrain => "beyond_drain",
-        Refusal::OutOfWindow => "out_of_window",
-        Refusal::Unacked => "unacked",
-        Refusal::Mismatch => "mismatch",
-        Refusal::StaleToken => "stale_token",
-        Refusal::FenceRequired => "fence_required",
+matryona_machines::symbols! {
+    /// The core's refusals as Symbols: the snake case of each variant.
+    pub Refusals for Refusal as "a refusal" {
+        Full => "full",
+        Busy => "busy",
+        ReplicaBusy => "replica_busy",
+        SameReplica => "same_replica",
+        Exhausted => "exhausted",
+        ClockRegressed => "clock_regressed",
+        Stale => "stale",
+        Unknown => "unknown",
+        OutOfPhase => "out_of_phase",
+        WrongReplica => "wrong_replica",
+        BehindBase => "behind_base",
+        BeyondDrain => "beyond_drain",
+        OutOfWindow => "out_of_window",
+        Unacked => "unacked",
+        Mismatch => "mismatch",
+        StaleToken => "stale_token",
+        FenceRequired => "fence_required",
     }
 }
 
@@ -88,7 +46,7 @@ pub const fn refusal(refusal: Refusal) -> &'static str {
 pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
     let to = match order.to() {
         Recipient::Replica(replica) => replica.into_value_with(ruby),
-        Recipient::Authority => ruby.to_symbol("authority").as_value(),
+        Recipient::Authority => symbol(ruby, "authority").as_value(),
     };
     let (name, value) = match order.action() {
         Action::Quiesce => ("quiesce", None),
@@ -100,5 +58,5 @@ pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
         Action::Resume { token } => ("resume", token.map(FencingToken::raw)),
         Action::Discard => ("discard", None),
     };
-    (to, ruby.to_symbol(name), value)
+    (to, symbol(ruby, name), value)
 }
