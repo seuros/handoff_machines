@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.6.0...handoff_machines/v0.6.1) (2026-11-14)
+
+
+### Bug Fixes
+
+* **deps:** require matryona-machines &gt;= 0.3 with which for action classes and lazy exact-field messages ([82c7f52](https://github.com/seuros/handoff_machines/commit/82c7f523249e43937a7c4367a8be1ab25c34784b))
+
 ## [0.6.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.5.0...handoff_machines/v0.6.0) (2026-11-14)
 
 
