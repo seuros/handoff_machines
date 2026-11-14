@@ -1,7 +1,7 @@
 //! Symbol names for the core's phases, refusals and orders.
 use handoff_machines::{Action, FencingToken, Order, Phase, Recipient, Refusal};
 use magnus::{IntoValue, Ruby, Symbol, Value, prelude::*};
-use matryona_machines::ruby::symbol;
+use matryona_machines::ruby::SymbolNames;
 
 matryona_machines::symbols! {
     /// The core's phases as Symbols: `TypeError` for a non-Symbol,
@@ -40,23 +40,47 @@ matryona_machines::symbols! {
     }
 }
 
+matryona_machines::symbols! {
+    /// The core's recipients as Symbols: `:authority` reads back; a
+    /// replica is its `Replica`.
+    pub Recipients for Recipient as "a recipient" => names_only {
+        Replica(..) => "replica",
+        Authority => "authority",
+    }
+}
+
+matryona_machines::symbols! {
+    /// The core's actions as Symbols: `:quiesce` and `:discard` read back;
+    /// every other action is its `Data`.
+    pub Actions for Action as "an action" => names_only {
+        Quiesce => "quiesce",
+        Drain { .. } => "drain",
+        Capture { .. } => "capture",
+        Install { .. } => "install",
+        Fence { .. } => "fence",
+        Activate { .. } => "activate",
+        Resume { .. } => "resume",
+        Discard => "discard",
+    }
+}
+
 /// Recipient (replica Integer or `:authority`), action name and its field
 /// (a token as its raw Integer);
 /// the Ruby side wraps them as `Replica` and the action `Data` values.
 pub fn order(ruby: &Ruby, order: &Order) -> (Value, Symbol, Option<u64>) {
     let to = match order.to() {
         Recipient::Replica(replica) => replica.into_value_with(ruby),
-        Recipient::Authority => symbol(ruby, "authority").as_value(),
+        Recipient::Authority => Recipients::symbol(ruby, &Recipient::Authority).as_value(),
     };
-    let (name, value) = match order.action() {
-        Action::Quiesce => ("quiesce", None),
-        Action::Drain { until } => ("drain", Some(until)),
-        Action::Capture { at } => ("capture", Some(at)),
-        Action::Install { checkpoint } => ("install", Some(checkpoint)),
-        Action::Fence { above } => ("fence", Some(above.raw())),
-        Action::Activate { token } => ("activate", Some(token.raw())),
-        Action::Resume { token } => ("resume", token.map(FencingToken::raw)),
-        Action::Discard => ("discard", None),
+    let action = order.action();
+    let value = match action {
+        Action::Quiesce | Action::Discard => None,
+        Action::Drain { until } => Some(until),
+        Action::Capture { at } => Some(at),
+        Action::Install { checkpoint } => Some(checkpoint),
+        Action::Fence { above } => Some(above.raw()),
+        Action::Activate { token } => Some(token.raw()),
+        Action::Resume { token } => token.map(FencingToken::raw),
     };
-    (to, symbol(ruby, name), value)
+    (to, Actions::symbol(ruby, &action), value)
 }

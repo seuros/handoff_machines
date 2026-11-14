@@ -85,6 +85,25 @@ class ValuesTest < Minitest::Test
     assert_raises(TypeError) { H::Order.new(ticket, one, Object.new) }
   end
 
+  # A recipient or an action is one argument with one message, whichever
+  # half refused it: RangeError for a Symbol, TypeError for anything else.
+  def test_a_refused_recipient_or_action_names_what_it_takes
+    ticket = H::Ticket.new(9, 1)
+    one = H::Replica.new(1)
+    recipient = 'a recipient is :authority or a HandoffMachines::Replica'
+    assert_equal recipient, assert_raises(RangeError) { H::Order.new(ticket, :replica, :quiesce) }.message
+    assert_equal recipient, assert_raises(TypeError) { H::Order.new(ticket, 1, :quiesce) }.message
+    action = 'an action is :quiesce, :discard or an action Data (exactly its class)'
+    assert_equal action, assert_raises(RangeError) { H::Order.new(ticket, one, :drain) }.message
+    assert_equal action, assert_raises(TypeError) { H::Order.new(ticket, one, 'quiesce') }.message
+    assert_equal action, assert_raises(TypeError) { H::Order.new(ticket, one, one) }.message
+    error = assert_raises(TypeError) { H::Fence.new(6) }
+    assert_equal 'expected a HandoffMachines::FencingToken or a value with #raw', error.message
+    error = assert_raises(TypeError) { H::Order.new([9, 1], one, :quiesce) }
+    assert_equal 'expected a HandoffMachines::Ticket', error.message
+    assert_equal 'expected a HandoffMachines::Limits', assert_raises(TypeError) { H::Handoff.new([1, 1]) }.message
+  end
+
   def test_statuses
     handoff, ticket = begun
     status = handoff.status(9)

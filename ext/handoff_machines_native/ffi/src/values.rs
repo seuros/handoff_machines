@@ -6,11 +6,15 @@
 use handoff_machines::{
     Acked, Action, FencingToken, Limits, Order, Phase, Recipient, Status, Ticket,
 };
-use magnus::{Error, Ruby, Symbol, Value, prelude::*};
-use matryona_machines::ruby::{Symbols, duration, exact_fields, instant, integer, optional, which};
+use magnus::{Error, Ruby, Value, prelude::*};
+use matryona_machines::ruby::{
+    Choice, Class, Symbols, duration, exact_fields, instant, integer, optional,
+    own_or_sibling_with, symbol_or_fields,
+};
 
-use crate::classes::{Origin, classes, fields};
-use crate::{names::Phases, raw_token};
+use crate::classes::classes;
+use crate::names::{Actions, Phases, Recipients};
+use crate::raw_token;
 
 fn range(ruby: &Ruby, message: &'static str) -> Error {
     Error::new(ruby.exception_range_error(), message)
@@ -29,24 +33,41 @@ fn limits_of(ruby: &Ruby, phase_budget: Value, per_replica: Value) -> Result<Lim
         .ok_or_else(|| range(ruby, "per_replica must be at least 1"))
 }
 
+/// The fields of exactly this gem's `class`, or of a sibling gem's value
+/// through its public readers; `TypeError` naming both for anything else, a
+/// subclass of `class` included. Runs Ruby on the sibling path, so it is
+/// called while converting arguments, before any core call.
+fn own_or_sibling<const N: usize>(
+    ruby: &Ruby,
+    value: Value,
+    class: Class,
+    readers: [&str; N],
+) -> Result<[Value; N], Error> {
+    let own = class.get(ruby);
+    own_or_sibling_with(ruby, value, own, readers, || {
+        format!("expected a {own} or a value with #{}", readers.join(", #"))
+    })
+}
+
 /// A token as the core's: this gem's `FencingToken` or a sibling's.
 pub fn token(ruby: &Ruby, value: Value) -> Result<FencingToken, Error> {
-    let [raw] = fields(ruby, value, classes(ruby)?.token, ["raw"], Origin::Sibling)?;
+    let [raw] = own_or_sibling(ruby, value, classes(ruby)?.token, ["raw"])?;
     raw_token(raw)
 }
 
 /// A ticket: only this gem's `Ticket`, through `Ticket::new`.
 pub fn ticket(ruby: &Ruby, value: Value) -> Result<Ticket, Error> {
-    let readers = ["partition", "generation"];
-    let [partition, generation] = fields(ruby, value, classes(ruby)?.ticket, readers, Origin::Own)?;
+    let class = classes(ruby)?.ticket.get(ruby);
+    let message = "expected a HandoffMachines::Ticket";
+    let [partition, generation] = exact_fields::<2>(ruby, value, class, message)?;
     crate::ticket(ruby, partition, generation)
 }
 
 /// Limits: only this gem's `Limits`, through `Limits::new`.
 pub fn limits(ruby: &Ruby, value: Value) -> Result<Limits, Error> {
-    let readers = ["phase_budget", "per_replica"];
-    let [phase_budget, per_replica] =
-        fields(ruby, value, classes(ruby)?.limits, readers, Origin::Own)?;
+    let class = classes(ruby)?.limits.get(ruby);
+    let message = "expected a HandoffMachines::Limits";
+    let [phase_budget, per_replica] = exact_fields::<2>(ruby, value, class, message)?;
     limits_of(ruby, phase_budget, per_replica)
 }
 
@@ -110,37 +131,27 @@ pub fn check_install(checkpoint: Value) -> Result<(), Error> {
     integer::<u64>(checkpoint, "checkpoint").map(drop)
 }
 
-/// The core's `Recipient`: this gem's `Replica`, or `:authority`.
+/// The core's `Recipient`: `:authority`, or exactly this gem's `Replica`.
 fn recipient(ruby: &Ruby, value: Value) -> Result<Recipient, Error> {
-    if let Some(symbol) = Symbol::from_value(value) {
-        return if symbol.name()? == "authority" {
-            Ok(Recipient::Authority)
-        } else {
-            Err(range(ruby, "the only recipient symbol is :authority"))
-        };
-    }
-    let [id] = fields(ruby, value, classes(ruby)?.replica, ["id"], Origin::Own)?;
-    Ok(Recipient::Replica(integer(id, "id")?))
+    let message = "a recipient is :authority or a HandoffMachines::Replica";
+    let replica = [classes(ruby)?.replica.get(ruby)];
+    Ok(
+        match symbol_or_fields(ruby, value, Recipients, &replica, message)? {
+            Choice::Symbol(recipient) => recipient,
+            Choice::Struct(_, [id]) => Recipient::Replica(integer(id, "id")?),
+        },
+    )
 }
 
 /// The core's `Action` from a Symbol (`:quiesce` or `:discard`, the two that
-/// carry no field) or one of this gem's action `Data` values.
+/// carry no field) or exactly one of this gem's action `Data` values.
 fn action(ruby: &Ruby, value: Value) -> Result<Action, Error> {
-    if let Some(symbol) = Symbol::from_value(value) {
-        return match symbol.name()?.as_ref() {
-            "quiesce" => Ok(Action::Quiesce),
-            "discard" => Ok(Action::Discard),
-            _other => Err(range(
-                ruby,
-                "only :quiesce and :discard are Symbols; every other action is its Data",
-            )),
-        };
-    }
-    let message = "an action is an action Data (exactly its class) or a Symbol";
+    let message = "an action is :quiesce, :discard or an action Data (exactly its class)";
     let actions = classes(ruby)?.actions.map(|class| class.get(ruby));
-    let index =
-        which(value, &actions).ok_or_else(|| Error::new(ruby.exception_type_error(), message))?;
-    let [field] = exact_fields::<1>(ruby, value, actions[index], message)?;
+    let (index, field) = match symbol_or_fields(ruby, value, Actions, &actions, message)? {
+        Choice::Symbol(action) => return Ok(action),
+        Choice::Struct(index, [field]) => (index, field),
+    };
     Ok(match index {
         0 => Action::Drain {
             until: integer(field, "until")?,

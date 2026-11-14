@@ -76,6 +76,19 @@ class ForgedTest < Minitest::Test
     assert_equal before, snapshot(handoff)
   end
 
+  def test_a_subclass_instance_is_refused_like_any_other_value
+    handoff, ticket = begun
+    forged = leaked(:LeakedTicket, H::Ticket).new(partition: 9, generation: 1)
+    error = assert_raises(TypeError) { handoff.outstanding(forged, 0, 4) }
+    assert_equal 'expected a HandoffMachines::Ticket', error.message
+    token = leaked(:LeakedToken, H::FencingToken).new(raw: 5)
+    error = assert_raises(TypeError) { handoff.fenced(ticket, token, 1) }
+    assert_equal 'expected a HandoffMachines::FencingToken or a value with #raw', error.message
+    replica = leaked(:LeakedReplica, H::Replica).new(id: 1)
+    error = assert_raises(TypeError) { H::Order.new(ticket, replica, :quiesce) }
+    assert_equal 'a recipient is :authority or a HandoffMachines::Replica', error.message
+  end
+
   def test_a_marshalled_value_is_validated_again
     handoff, ticket = begun
     before = snapshot(handoff)
