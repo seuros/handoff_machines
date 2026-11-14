@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.4.0...handoff_machines/v0.5.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* private validated fields, refuse bare :resume and a drain at its quiesce point, exact-class reads, clone-then-keep acks
+
+### Features
+
+* private validated fields, refuse bare :resume and a drain at its quiesce point, exact-class reads, clone-then-keep acks ([ff05be6](https://github.com/seuros/handoff_machines/commit/ff05be61aedb4e27ac599d94d8ee2d28afb7b308))
+
 ## [0.4.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.3.0...handoff_machines/v0.4.0) (2026-11-13)
 
 
