@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.6.1...handoff_machines/v0.7.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* read handoff recipients and actions with symbol_or_fields and tokens with own_or_sibling
+
+### Features
+
+* read handoff recipients and actions with symbol_or_fields and tokens with own_or_sibling ([b5693d0](https://github.com/seuros/handoff_machines/commit/b5693d06886fa5e4ce7ee93aeab3399f5014d935))
+
 ## [0.6.1](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.6.0...handoff_machines/v0.6.1) (2026-11-14)
 
 
