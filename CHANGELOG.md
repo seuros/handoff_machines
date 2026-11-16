@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.8.1...handoff_machines/v0.8.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* fix wrapped classes at load so building a value runs no Ruby ([2480564](https://github.com/seuros/handoff_machines/commit/2480564c1c1223dfdbe5e953eccb818ecab11cf9))
+
 ## [0.8.1](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.8.0...handoff_machines/v0.8.1) (2026-11-16)
 
 
