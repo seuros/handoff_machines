@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.8.0...handoff_machines/v0.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* Status::new refuses tokens no fence or abort could admit ([97b04ef](https://github.com/seuros/handoff_machines/commit/97b04efdfaa2a470d3644601e5e61e9ac21700ff))
+
 ## [0.8.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.7.0...handoff_machines/v0.8.0) (2026-11-16)
 
 
