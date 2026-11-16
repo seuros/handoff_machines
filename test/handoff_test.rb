@@ -300,6 +300,27 @@ class HandoffTest < Minitest::Test
     assert_equal rec(:drain), handoff.drained(ticket, 1, 10, 3)
   end
 
+  DURATION_MAX = ((2**64) - 1) * 1_000_000_000 + 999_999_999
+
+  # Bug: the coordinator answered a deadline past 2**64-1 that its own `now`
+  # readers then refused, raising RangeError, so the transfer was never overdue.
+  def test_every_deadline_reads_back_as_now
+    top = 2**64 - 1
+    handoff = H::Handoff.new(H::Limits.new(1, 2))
+    ticket = handoff.start(9, 1, 2, 10, tok(5), top)
+    deadline = handoff.status(9).deadline
+    assert_equal 2**64, deadline
+    assert_equal [[ticket], 16], handoff.overdue(deadline, 0, 16)
+    assert_equal rec(:drain), handoff.quiesced(ticket, 1, 12, deadline)
+    assert_equal rec(:rollback), handoff.abort(ticket, nil, DURATION_MAX)
+    assert_equal DURATION_MAX, handoff.status(9).deadline
+    [-1, DURATION_MAX + 1].each do |bad|
+      assert_raises(RangeError) { handoff.overdue(bad, 0, 1) }
+      assert_raises(RangeError) { handoff.start(1, 3, 4, 0, tok(1), bad) }
+    end
+    assert_raises(RangeError) { H::Limits.new(2**64, 1) }
+  end
+
   def test_validation
     handoff, ticket = begun
     [1.0, nil, '1', Float::NAN].each do |bad|
@@ -341,7 +362,6 @@ class HandoffTest < Minitest::Test
     assert_equal top + (5 * SECOND), handoff.status(top).deadline
     assert_equal rec(:drain), handoff.quiesced(ticket, top, top, top)
     assert_equal [top - 1], missing(handoff, ticket)
-    # The deadline is past every `now` the coordinator accepts, so it is never overdue.
     assert_equal [[], 16], handoff.overdue(top, 0, 16)
     handoff.freeze
     assert_raises(FrozenError) { handoff.drained(ticket, top, top - 1, top) }

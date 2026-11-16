@@ -8,7 +8,10 @@ module HandoffMachines
   # Integer nanoseconds on one monotonic clock, for instants (now, deadline)
   # and spans (phase_budget) alike:
   # Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond). A non-Integer
-  # raises TypeError; a value outside 0..2**64-1 raises RangeError.
+  # raises TypeError. A span outside 0..2**64-1 raises RangeError; an instant
+  # is read over the whole `Duration` range, 0..Duration::MAX nanoseconds, so
+  # every deadline the coordinator answers reads back as `now`, and raises
+  # RangeError outside it.
   type nanoseconds = Integer
   type phase = :quiesce | :drain | :checkpoint | :activate | :rollback | :complete | :aborted
   # Every symbol that means "this call was not honoured and changed nothing":
@@ -169,7 +172,7 @@ module HandoffMachines
   # The core's `Status::checked`: an issued ticket, two different replicas,
   # a phase that is not final and only what that phase has recorded; during
   # the drain, a quiesce point above `base`. The
-  # deadline may exceed 2**64-1: the core saturates now + phase_budget.
+  # deadline is now + phase_budget, saturating at Duration::MAX.
   class Status < Data
     attr_reader ticket: Ticket
     attr_reader source: Integer

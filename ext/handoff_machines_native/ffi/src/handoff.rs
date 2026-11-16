@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use handoff_machines::{Acked, FencingToken, Refusal, Ticket};
 use magnus::{Error, Integer, IntoValue, RArray, Ruby, Value, prelude::*, typed_data::Obj};
-use matryona_machines::ruby::{Symbols, duration, fencing, integer, keep, nanoseconds, optional};
+use matryona_machines::ruby::{Symbols, fencing, instant, integer, keep, nanoseconds, optional};
 
 use crate::classes::classes;
 use crate::values::{self, Family};
@@ -20,12 +20,7 @@ fn report(
     name: &str,
 ) -> Result<(Ticket, u64, u64, Duration), Error> {
     let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
-    Ok((
-        ticket,
-        replica,
-        integer(value, name)?,
-        duration(now, "now")?,
-    ))
+    Ok((ticket, replica, integer(value, name)?, instant(now, "now")?))
 }
 
 /// A ticket, a replica and a `now`, converted in that order.
@@ -36,7 +31,7 @@ fn settle(
     now: Value,
 ) -> Result<(Ticket, u64, Duration), Error> {
     let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
-    Ok((ticket, replica, duration(now, "now")?))
+    Ok((ticket, replica, instant(now, "now")?))
 }
 
 /// A refusal's symbol.
@@ -119,7 +114,7 @@ impl Handoff {
         let (partition, source) = (integer(partition, "partition")?, integer(source, "source")?);
         let (target, base) = (integer(target, "target")?, integer(base, "base")?);
         let held = fencing::token::<Family>(ruby, source_token)?;
-        let now = duration(now, "now")?;
+        let now = instant(now, "now")?;
         let class = classes(ruby)?.ticket.get(ruby);
         let start = |core: &mut Core| core.start(partition, source, target, base, held, now);
         keep(ruby, this, &this.core, start, |started| match started {
@@ -230,7 +225,7 @@ impl Handoff {
             values::ticket(ruby, ticket)?,
             fencing::token::<Family>(ruby, token)?,
         );
-        let now = duration(now, "now")?;
+        let now = instant(now, "now")?;
         Self::ack(ruby, this, |core| core.fenced(ticket, token, now))
     }
 
@@ -244,10 +239,7 @@ impl Handoff {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
-        let (token, now) = (
-            fencing::token::<Family>(ruby, token)?,
-            duration(now, "now")?,
-        );
+        let (token, now) = (fencing::token::<Family>(ruby, token)?, instant(now, "now")?);
         Self::ack(ruby, this, |core| {
             core.activated(ticket, replica, token, now)
         })
@@ -265,7 +257,7 @@ impl Handoff {
         let token = token
             .map(|token| fencing::token::<Family>(ruby, token))
             .transpose()?;
-        let now = duration(now, "now")?;
+        let now = instant(now, "now")?;
         Self::ack(ruby, this, |core| core.abort(ticket, token, now))
     }
 
@@ -362,7 +354,7 @@ impl Handoff {
         from: Value,
         limit: Value,
     ) -> Result<(RArray, usize), Error> {
-        let (now, from) = (duration(now, "now")?, integer(from, "from")?);
+        let (now, from) = (instant(now, "now")?, integer(from, "from")?);
         let limit = integer(limit, "limit")?;
         let core = this.core.borrow();
         let mut pass = core.overdue(now, from);
