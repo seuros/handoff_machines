@@ -7,15 +7,7 @@ const HOME: u16 = 3;
 /// Partition 9 from replica 1 to replica 2 under source token 5 of `HOME`,
 /// waiting for the authority's token.
 fn awaiting_fence() -> (Small, Ticket) {
-    let mut h = Small::new(LIMITS);
-    let held = token_in(HOME, 5);
-    let t = h.start(9, 1, 2, 10, held, at(0)).unwrap();
-    assert_eq!(h.quiesced(t, 1, 10, at(1)), recorded(Phase::Checkpoint));
-    assert_eq!(h.captured(t, 1, 77, at(1)), recorded(Phase::Checkpoint));
-    assert_eq!(h.installed(t, 2, 77, at(1)), recorded(Phase::Activate));
-    let above = Action::Fence { above: held };
-    assert_eq!(orders(&h), [(Recipient::Authority, above)]);
-    (h, t)
+    awaiting_fence_above(token_in(HOME, 5))
 }
 
 /// Tokens of other scopes: raw values below, above and far above `HOME`'s.

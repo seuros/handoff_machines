@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, format, string::String, vec::Vec};
 
 use super::draws::{Draws, chance, fencing, sorted};
 use super::model::{Model, Wait};
-use super::{LIMITS, token};
-use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Status, Ticket};
+use super::{LIMITS, rebuilt, token};
+use crate::{Acked, Duration, Handoff, Order, Phase, Refusal, Ticket};
 use periscope_machines::{scope_of, scoped, sequence_of};
 
 const N: usize = 4;
@@ -321,7 +321,8 @@ impl Run {
         for partition in 0..6 {
             let status = self.core.status(partition);
             assert_eq!(status, self.model.status(partition));
-            assert_eq!(status.and_then(Status::checked), status, "{status:?}");
+            // Every status the core reports is one the public constructor accepts.
+            assert_eq!(status.and_then(rebuilt), status, "{status:?}");
         }
         for order in self.core.orders(0) {
             assert_eq!(

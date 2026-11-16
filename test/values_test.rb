@@ -68,6 +68,30 @@ class ValuesTest < Minitest::Test
     assert_raises(TypeError) { H::Fence.new(nil) }
   end
 
+  # Bug: `Resume.new(false)` skipped the token check and built a value that
+  # `Order.new` then refused.
+  def test_resume_token_is_nil_or_a_token
+    [H::Fence, H::Activate, H::Resume].each do |klass|
+      assert_raises(TypeError) { klass.new(false) }
+    end
+  end
+
+  # Bug: `Status.new` accepted an activation token at sequence 1 (never above
+  # a source token) and a rollback keeping one at the last sequence (never
+  # superseded by `abort`).
+  def test_status_token_is_one_the_fence_and_the_abort_could_admit
+    last = (1 << 48) - 1
+    [0, 1, 65_535].each do |scope|
+      fenced = ->(phase, seq) { H::Status.new(H::Ticket.new(9, 1), 1, 2, phase, 0, 0, 77, tok((scope << 48) | seq), 0) }
+      assert_raises(RangeError) { fenced.(:activate, 1) }
+      assert_raises(RangeError) { fenced.(:rollback, 1) }
+      assert_raises(RangeError) { fenced.(:rollback, last) }
+      assert_equal :activate, fenced.(:activate, last).phase
+      assert_equal :rollback, fenced.(:rollback, last - 1).phase
+      assert_equal :rollback, fenced.(:rollback, 2).phase
+    end
+  end
+
   def test_orders
     ticket = H::Ticket.new(9, 1)
     one = H::Replica.new(1)

@@ -34,7 +34,35 @@ pub fn token_in(scope: u16, sequence: u64) -> FencingToken {
     token(scoped(scope, sequence))
 }
 
+/// A status rebuilt through the public constructor from its own fields.
+pub fn rebuilt(status: Status) -> Option<Status> {
+    Status::new(
+        status.ticket(),
+        status.source(),
+        status.target(),
+        status.phase(),
+        status.base(),
+        status.until(),
+        status.checkpoint(),
+        status.token(),
+        status.deadline(),
+    )
+}
+
 pub type Small = Handoff<2, 1>;
+
+/// Partition 9 from replica 1 to replica 2 under source token `held`,
+/// waiting for the authority's token.
+pub fn awaiting_fence_above(held: FencingToken) -> (Small, Ticket) {
+    let mut h = Small::new(LIMITS);
+    let t = h.start(9, 1, 2, 10, held, at(0)).unwrap();
+    assert_eq!(h.quiesced(t, 1, 10, at(1)), recorded(Phase::Checkpoint));
+    assert_eq!(h.captured(t, 1, 77, at(1)), recorded(Phase::Checkpoint));
+    assert_eq!(h.installed(t, 2, 77, at(1)), recorded(Phase::Activate));
+    let above = Action::Fence { above: held };
+    assert_eq!(orders(&h), [(Recipient::Authority, above)]);
+    (h, t)
+}
 type Answer = Result<Acked, Refusal>;
 type Ack<'a> = dyn Fn(&mut Small) -> Answer + 'a;
 

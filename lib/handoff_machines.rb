@@ -135,9 +135,10 @@ module HandoffMachines
   Activate = Data.define(:token) do
     def initialize(token:) = super(token: HandoffMachines.__send__(:__token, token))
   end
-  # `token` is nil when the rollback was not fenced.
+  # `token` is nil when the rollback was not fenced; anything else is checked
+  # as a token, so `false` is a TypeError.
   Resume = Data.define(:token) do
-    def initialize(token:) = super(token: token && HandoffMachines.__send__(:__token, token))
+    def initialize(token:) = super(token: token.nil? ? nil : HandoffMachines.__send__(:__token, token))
   end
 
   # One outstanding instruction: who must act (`to`, a Replica or

@@ -1,9 +1,12 @@
 //! Values valid by construction, and which honoured answers record the clock.
 use matryona_machines::testing::refuses;
 
-use super::{LIMITS, Small, advanced, at, begun, recorded, repeat, token};
+use super::{
+    LIMITS, Small, advanced, at, awaiting_fence_above, begun, rebuilt, recorded, repeat, token,
+    token_in,
+};
 use crate::{Acked, Action, Duration, Limits, Order, Phase, Recipient, Refusal, Status, Ticket};
-use periscope_machines::scoped;
+use periscope_machines::{SEQUENCE_MAX, scoped};
 
 /// Run `ack` on two copies at two instants; the copies end equal exactly
 /// when the answer recorded nothing that depends on the instant.
@@ -129,18 +132,7 @@ fn only_the_authority_fences_and_it_does_nothing_else() {
 fn a_status_is_one_a_live_transfer_reports() {
     for steps in 0..5 {
         let status = advanced(steps).0.status(9).unwrap();
-        let rebuilt = Status::new(
-            status.ticket(),
-            status.source(),
-            status.target(),
-            status.phase(),
-            status.base(),
-            status.until(),
-            status.checkpoint(),
-            status.token(),
-            status.deadline(),
-        );
-        assert_eq!(rebuilt, Some(status));
+        assert_eq!(rebuilt(status), Some(status));
         assert_eq!(status.checked(), Some(status));
         let broken = [
             Status {
@@ -214,6 +206,49 @@ fn a_status_is_one_a_live_transfer_reports() {
         .checked(),
         None
     );
+}
+
+// Bug: `Status::new` accepted an activation token no `fenced` could admit
+// (sequence 1, never above a source token) and a rollback keeping one no
+// `abort` could supersede (sequence `SEQUENCE_MAX`).
+#[test]
+fn a_status_token_is_one_the_fence_and_the_abort_could_admit() {
+    for scope in [0, 1, u16::MAX] {
+        // The edges the core does reach, rebuilt as they were reported.
+        let (mut low, t) = awaiting_fence_above(token_in(scope, 1));
+        low.fenced(t, token_in(scope, 2), at(1)).unwrap();
+        let lowest = low.status(9).unwrap();
+        assert_eq!(rebuilt(lowest), Some(lowest));
+        low.abort(t, Some(token_in(scope, 3)), at(1)).unwrap();
+        let rolled = low.status(9).unwrap();
+        assert_eq!(rebuilt(rolled), Some(rolled));
+        let (mut high, t) = awaiting_fence_above(token_in(scope, SEQUENCE_MAX - 2));
+        high.fenced(t, token_in(scope, SEQUENCE_MAX - 1), at(1))
+            .unwrap();
+        let fenced = high.status(9).unwrap();
+        assert_eq!(rebuilt(fenced), Some(fenced));
+        high.abort(t, Some(token_in(scope, SEQUENCE_MAX)), at(1))
+            .unwrap();
+        let rolled = high.status(9).unwrap();
+        assert_eq!(rebuilt(rolled), Some(rolled));
+        let (mut top, t) = awaiting_fence_above(token_in(scope, SEQUENCE_MAX - 1));
+        top.fenced(t, token_in(scope, SEQUENCE_MAX), at(1)).unwrap();
+        let topmost = top.status(9).unwrap();
+        assert_eq!(rebuilt(topmost), Some(topmost));
+        // The ones it never reports.
+        for (phase, sequence) in [
+            (Phase::Activate, 1),
+            (Phase::Rollback, 1),
+            (Phase::Rollback, SEQUENCE_MAX),
+        ] {
+            let impossible = Status {
+                phase,
+                token: Some(token_in(scope, sequence)),
+                ..lowest
+            };
+            assert_eq!(rebuilt(impossible), None, "{impossible:?}");
+        }
+    }
 }
 
 /// A drain that reached its quiesce point has moved on to the capture, on

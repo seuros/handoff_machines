@@ -1,7 +1,7 @@
 use core::time::Duration;
 
 use lease_machines::FencingToken;
-use periscope_machines::{scope_of, sequence_of};
+use periscope_machines::{SEQUENCE_MAX, scope_of, sequence_of};
 
 /// Identity of one transfer: the partition and the generation it was issued under.
 ///
@@ -277,6 +277,9 @@ impl Status {
     /// before the drain is over and one once activation is under way; an
     /// activation token only with a checkpoint, and only while activating or
     /// rolling back. A rollback keeps whatever was recorded when it began.
+    /// An activation token exceeds a source token of its scope, so its
+    /// sequence is at least two; one a rollback keeps was superseded by a
+    /// newer token of that scope, so its sequence is below the last.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // One per field, in field order.
     pub const fn new(
@@ -326,8 +329,19 @@ impl Status {
             (_, Some(until)) => self.base <= until,
             (_, None) => true,
         };
+        // `fenced` admits only a token above the source token, whose sequence
+        // is at least one; a rollback keeps one only when `abort` was given a
+        // newer token of the same scope, so it is below the last sequence.
+        let fenced = match (self.phase, self.token) {
+            (Phase::Activate, Some(token)) => sequence_of(token.raw()) > 1,
+            (Phase::Rollback, Some(token)) => {
+                let sequence = sequence_of(token.raw());
+                sequence > 1 && sequence < SEQUENCE_MAX
+            }
+            _ => true,
+        };
         let issued = Ticket::new(self.ticket.partition, self.ticket.generation).is_some();
-        if recorded && based && issued && self.source != self.target {
+        if recorded && based && fenced && issued && self.source != self.target {
             Some(self)
         } else {
             None
