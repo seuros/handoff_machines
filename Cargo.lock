@@ -81,7 +81,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "handoff-machines"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "lease-machines",
  "matryona-machines",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "handoff_machines_native"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "handoff-machines",
  "magnus",

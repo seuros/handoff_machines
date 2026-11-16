@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.7.0...handoff_machines/v0.8.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* generation is nil before the first, restored takes nil
+
+### Features
+
+* generation is nil before the first, restored takes nil ([837a82b](https://github.com/seuros/handoff_machines/commit/837a82bdf67ebfbe64e9e63eaaa8dd6f7d0dda2a))
+
 ## [0.7.0](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.6.1...handoff_machines/v0.7.0) (2026-11-14)
 
 
