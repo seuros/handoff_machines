@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.3](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.8.2...handoff_machines/v0.8.3) (2026-11-16)
+
+
+### Bug Fixes
+
+* accept every instant the gem returns ([5eab924](https://github.com/seuros/handoff_machines/commit/5eab9242935b9329d0a91c1a21e7ba201cf0d12d))
+
 ## [0.8.2](https://github.com/seuros/handoff_machines/compare/handoff_machines/v0.8.1...handoff_machines/v0.8.2) (2026-11-16)
 
 
