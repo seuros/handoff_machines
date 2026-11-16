@@ -2,7 +2,7 @@
 //! check, the own-or-sibling read (see `values`) and clone-then-keep are
 //! `matryona_machines::ruby`'s.
 use magnus::{Error, RModule, Ruby};
-use matryona_machines::ruby::{Class, Registry};
+use matryona_machines::ruby::Class;
 
 /// Every `Data` class the binding checks or builds.
 pub struct Classes {
@@ -19,7 +19,11 @@ pub struct Classes {
 /// The action names whose classes [`Classes::actions`] holds, in order.
 pub const ACTIONS: [&str; 6] = ["Drain", "Capture", "Install", "Fence", "Activate", "Resume"];
 
-static CLASSES: Registry<Classes> = Registry::new("handoff_machines");
+matryona_machines::registry! {
+    static CLASSES: Classes = "handoff_machines";
+    /// The classes resolved at load.
+    pub fn classes;
+}
 
 /// Resolve the classes `handoff_machines.rb` defined before requiring the
 /// extension. Called once, from init; never by name again.
@@ -43,9 +47,4 @@ pub fn resolve(ruby: &Ruby, module: RModule) -> Result<(), Error> {
         ],
     };
     CLASSES.set(ruby, classes).map(drop)
-}
-
-/// The classes resolved at load.
-pub fn classes(ruby: &Ruby) -> Result<&'static Classes, Error> {
-    CLASSES.get(ruby)
 }

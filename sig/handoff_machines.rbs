@@ -195,10 +195,10 @@ module HandoffMachines
     # in 0..65_535 (TypeError for a non-Integer, RangeError outside the range).
     def self.with_scope: (Limits limits, Integer scope) -> Handoff
     # Generations of `scope` above `last_generation`, what #generation answered
-    # before the restart. RangeError when `last_generation` is not of `scope`:
-    # a value from another scope, one that lost its top bits, or a bare 0 for
-    # a non-zero scope. With nothing saved, call with_scope.
-    def self.restored: (Limits limits, Integer scope, Integer last_generation) -> Handoff
+    # before the restart (nil: nothing issued, an equal fresh coordinator).
+    # RangeError when `last_generation` is not a generation of `scope`: a value
+    # from another scope, one that lost its top bits, or a bare 0.
+    def self.restored: (Limits limits, Integer scope, Integer? last_generation) -> Handoff
     def scope: () -> Integer
     def limits: () -> Limits
     # `source_token`'s scope is the transfer's token scope.
@@ -249,13 +249,14 @@ module HandoffMachines
                      -> (Array[Integer] | :stale | :unknown | :out_of_phase)
     def overdue: (nanoseconds now, Integer from, Integer limit) -> [Array[Ticket], Integer]
     def active: () -> Integer
-    def generation: () -> Integer
+    # The highest generation issued, scope included; nil before the first.
+    def generation: () -> Integer?
 
     private
 
-    def self.native_with_scope: (Limits, Integer) -> Handoff
-    def self.native_restored: (Limits, Integer, Integer) -> Handoff
-    def self.native_scope_of: (Ticket) -> Integer
+    private def self.native_with_scope: (Limits, Integer) -> Handoff
+    private def self.native_restored: (Limits, Integer, Integer?) -> Handoff
+    private def self.native_scope_of: (Ticket) -> Integer
     def native_limits: () -> [Integer, Integer]
     def order: (Integer, Integer, Integer | :authority, Symbol, Integer?) -> Order
     def action: (Symbol, Integer?) -> action
@@ -268,20 +269,20 @@ module HandoffMachines
 
   ACTIONS: Hash[Symbol, singleton(Data)]
   TOKENED: Array[Symbol]
-  def self.native_raw: (Integer) -> nil
-  def self.native_token_scope: (_FencingToken) -> Integer
-  def self.native_token_order: (_FencingToken, _FencingToken) -> (-1 | 0 | 1)?
-  def self.native_token_newer: (_FencingToken, _FencingToken) -> bool
-  def self.__limits: (Integer, Integer) -> nil
-  def self.__ticket: (Integer, Integer) -> nil
-  def self.__recorded: (phase) -> nil
-  def self.__duplicate: (phase) -> nil
-  def self.__replica: (Integer) -> nil
-  def self.__drain: (Integer) -> nil
-  def self.__capture: (Integer) -> nil
-  def self.__install: (Integer) -> nil
-  def self.__token: (_FencingToken) -> FencingToken
-  def self.__order: (Ticket, recipient, action) -> nil
-  def self.__status: (Ticket, Integer, Integer, phase, Integer, Integer?, Integer?, _FencingToken?, Integer)
-                     -> FencingToken?
+  private def self.native_raw: (Integer) -> nil
+  private def self.native_token_scope: (_FencingToken) -> Integer
+  private def self.native_token_order: (_FencingToken, _FencingToken) -> (-1 | 0 | 1)?
+  private def self.native_token_newer: (_FencingToken, _FencingToken) -> bool
+  private def self.__limits: (Integer, Integer) -> nil
+  private def self.__ticket: (Integer, Integer) -> nil
+  private def self.__recorded: (phase) -> nil
+  private def self.__duplicate: (phase) -> nil
+  private def self.__replica: (Integer) -> nil
+  private def self.__drain: (Integer) -> nil
+  private def self.__capture: (Integer) -> nil
+  private def self.__install: (Integer) -> nil
+  private def self.__token: (_FencingToken) -> FencingToken
+  private def self.__order: (Ticket, recipient, action) -> nil
+  private def self.__status: (Ticket, Integer, Integer, phase, Integer, Integer?, Integer?, _FencingToken?, Integer)
+                             -> FencingToken?
 end

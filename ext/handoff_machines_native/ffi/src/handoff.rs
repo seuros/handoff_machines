@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use handoff_machines::{Acked, FencingToken, Refusal, Ticket};
 use magnus::{Error, Integer, IntoValue, RArray, Ruby, Value, prelude::*, typed_data::Obj};
-use matryona_machines::ruby::{Symbols, duration, integer, keep, nanoseconds};
+use matryona_machines::ruby::{Symbols, duration, fencing, integer, keep, nanoseconds, optional};
 
 use crate::classes::classes;
-use crate::values;
+use crate::values::{self, Family};
 use crate::{Core, names};
 
 type Outcome = Result<Acked, Refusal>;
@@ -77,7 +77,7 @@ impl Handoff {
         last_generation: Value,
     ) -> Result<Self, Error> {
         let (limits, scope) = (values::limits(ruby, limits)?, integer(scope, "scope")?);
-        let last_generation = integer(last_generation, "last_generation")?;
+        let last_generation = optional(last_generation, "last_generation")?;
         Core::restored(limits, scope, last_generation)
             .map(|core| Self {
                 core: RefCell::new(core),
@@ -118,7 +118,7 @@ impl Handoff {
         this.check_frozen()?;
         let (partition, source) = (integer(partition, "partition")?, integer(source, "source")?);
         let (target, base) = (integer(target, "target")?, integer(base, "base")?);
-        let held = values::token(ruby, source_token)?;
+        let held = fencing::token::<Family>(ruby, source_token)?;
         let now = duration(now, "now")?;
         let class = classes(ruby)?.ticket.get(ruby);
         let start = |core: &mut Core| core.start(partition, source, target, base, held, now);
@@ -226,7 +226,10 @@ impl Handoff {
         now: Value,
     ) -> Result<Value, Error> {
         this.check_frozen()?;
-        let (ticket, token) = (values::ticket(ruby, ticket)?, values::token(ruby, token)?);
+        let (ticket, token) = (
+            values::ticket(ruby, ticket)?,
+            fencing::token::<Family>(ruby, token)?,
+        );
         let now = duration(now, "now")?;
         Self::ack(ruby, this, |core| core.fenced(ticket, token, now))
     }
@@ -241,7 +244,10 @@ impl Handoff {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let (ticket, replica) = (values::ticket(ruby, ticket)?, integer(replica, "replica")?);
-        let (token, now) = (values::token(ruby, token)?, duration(now, "now")?);
+        let (token, now) = (
+            fencing::token::<Family>(ruby, token)?,
+            duration(now, "now")?,
+        );
         Self::ack(ruby, this, |core| {
             core.activated(ticket, replica, token, now)
         })
@@ -256,7 +262,9 @@ impl Handoff {
     ) -> Result<Value, Error> {
         this.check_frozen()?;
         let ticket = values::ticket(ruby, ticket)?;
-        let token = token.map(|token| values::token(ruby, token)).transpose()?;
+        let token = token
+            .map(|token| fencing::token::<Family>(ruby, token))
+            .transpose()?;
         let now = duration(now, "now")?;
         Self::ack(ruby, this, |core| core.abort(ticket, token, now))
     }
@@ -369,7 +377,7 @@ impl Handoff {
         self.core.borrow().active()
     }
 
-    pub fn generation(&self) -> u64 {
+    pub fn generation(&self) -> Option<u64> {
         self.core.borrow().generation()
     }
 }

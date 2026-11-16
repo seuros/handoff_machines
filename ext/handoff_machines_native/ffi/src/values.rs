@@ -8,13 +8,12 @@ use handoff_machines::{
 };
 use magnus::{Error, Ruby, Value, prelude::*};
 use matryona_machines::ruby::{
-    Choice, Class, Symbols, duration, exact_fields, instant, integer, optional,
-    own_or_sibling_with, symbol_or_fields,
+    Choice, Refused, Symbols, duration, exact_fields, fencing, instant, integer, optional,
+    symbol_or_fields_why,
 };
 
 use crate::classes::classes;
 use crate::names::{Actions, Phases, Recipients};
-use crate::raw_token;
 
 fn range(ruby: &Ruby, message: &'static str) -> Error {
     Error::new(ruby.exception_range_error(), message)
@@ -33,26 +32,12 @@ fn limits_of(ruby: &Ruby, phase_budget: Value, per_replica: Value) -> Result<Lim
         .ok_or_else(|| range(ruby, "per_replica must be at least 1"))
 }
 
-/// The fields of exactly this gem's `class`, or of a sibling gem's value
-/// through its public readers; `TypeError` naming both for anything else, a
-/// subclass of `class` included. Runs Ruby on the sibling path, so it is
-/// called while converting arguments, before any core call.
-fn own_or_sibling<const N: usize>(
-    ruby: &Ruby,
-    value: Value,
-    class: Class,
-    readers: [&str; N],
-) -> Result<[Value; N], Error> {
-    let own = class.get(ruby);
-    own_or_sibling_with(ruby, value, own, readers, || {
-        format!("expected a {own} or a value with #{}", readers.join(", #"))
-    })
-}
-
-/// A token as the core's: this gem's `FencingToken` or a sibling's.
-pub fn token(ruby: &Ruby, value: Value) -> Result<FencingToken, Error> {
-    let [raw] = own_or_sibling(ruby, value, classes(ruby)?.token, ["raw"])?;
-    raw_token(raw)
+matryona_machines::fencing_family! {
+    /// The handoff core's fencing token (lease-machines' type), for
+    /// `matryona_machines::ruby::fencing`.
+    pub Family in classes {
+        token: FencingToken,
+    }
 }
 
 /// A ticket: only this gem's `Ticket`, through `Ticket::new`.
@@ -69,18 +54,6 @@ pub fn limits(ruby: &Ruby, value: Value) -> Result<Limits, Error> {
     let message = "expected a HandoffMachines::Limits";
     let [phase_budget, per_replica] = exact_fields::<2>(ruby, value, class, message)?;
     limits_of(ruby, phase_budget, per_replica)
-}
-
-/// A `HandoffMachines::FencingToken` of `token`, built by its `new`.
-fn token_object(ruby: &Ruby, token: FencingToken) -> Result<Value, Error> {
-    let class = classes(ruby)?.token.get(ruby);
-    class.funcall("new", (token.raw(),))
-}
-
-/// `Fence.new`, `Activate.new`, `Resume.new`: a token read as [`token`]
-/// reads it, answered as this gem's own to keep in place of the one given.
-pub fn check_token(ruby: &Ruby, held: Value) -> Result<Value, Error> {
-    token_object(ruby, token(ruby, held)?)
 }
 
 /// `Limits.new`.
@@ -133,10 +106,13 @@ pub fn check_install(checkpoint: Value) -> Result<(), Error> {
 
 /// The core's `Recipient`: `:authority`, or exactly this gem's `Replica`.
 fn recipient(ruby: &Ruby, value: Value) -> Result<Recipient, Error> {
-    let message = "a recipient is :authority or a HandoffMachines::Replica";
     let replica = [classes(ruby)?.replica.get(ruby)];
+    let message = |why: Refused<'_>| match why {
+        Refused::UnknownSymbol(symbol) => format!("unknown recipient {}", symbol.inspect()),
+        _ => "a recipient is :authority or a HandoffMachines::Replica".into(),
+    };
     Ok(
-        match symbol_or_fields(ruby, value, Recipients, &replica, message)? {
+        match symbol_or_fields_why(ruby, value, Recipients, &replica, message)? {
             Choice::Symbol(recipient) => recipient,
             Choice::Struct(_, [id]) => Recipient::Replica(integer(id, "id")?),
         },
@@ -146,9 +122,12 @@ fn recipient(ruby: &Ruby, value: Value) -> Result<Recipient, Error> {
 /// The core's `Action` from a Symbol (`:quiesce` or `:discard`, the two that
 /// carry no field) or exactly one of this gem's action `Data` values.
 fn action(ruby: &Ruby, value: Value) -> Result<Action, Error> {
-    let message = "an action is :quiesce, :discard or an action Data (exactly its class)";
     let actions = classes(ruby)?.actions.map(|class| class.get(ruby));
-    let (index, field) = match symbol_or_fields(ruby, value, Actions, &actions, message)? {
+    let message = |why: Refused<'_>| match why {
+        Refused::UnknownSymbol(symbol) => format!("unknown action {}", symbol.inspect()),
+        _ => "an action is :quiesce, :discard or an action Data (exactly its class)".into(),
+    };
+    let (index, field) = match symbol_or_fields_why(ruby, value, Actions, &actions, message)? {
         Choice::Symbol(action) => return Ok(action),
         Choice::Struct(index, [field]) => (index, field),
     };
@@ -163,16 +142,16 @@ fn action(ruby: &Ruby, value: Value) -> Result<Action, Error> {
             checkpoint: integer(field, "checkpoint")?,
         },
         3 => Action::Fence {
-            above: token(ruby, field)?,
+            above: fencing::token::<Family>(ruby, field)?,
         },
         4 => Action::Activate {
-            token: token(ruby, field)?,
+            token: fencing::token::<Family>(ruby, field)?,
         },
         _resume => Action::Resume {
             token: if field.is_nil() {
                 None
             } else {
-                Some(token(ruby, field)?)
+                Some(fencing::token::<Family>(ruby, field)?)
             },
         },
     })
@@ -209,7 +188,9 @@ pub fn check_status(
         optional(until, "until")?,
         optional(checkpoint, "checkpoint")?,
     );
-    let fence = fence.map(|fence| token(ruby, fence)).transpose()?;
+    let fence = fence
+        .map(|fence| fencing::token::<Family>(ruby, fence))
+        .transpose()?;
     let status = Status::new(
         held,
         source,
@@ -224,5 +205,7 @@ pub fn check_status(
         instant(deadline, "deadline")?,
     );
     status.ok_or_else(|| range(ruby, "no live transfer reports this status"))?;
-    fence.map(|fence| token_object(ruby, fence)).transpose()
+    fence
+        .map(|fence| fencing::token_object::<Family>(ruby, fence))
+        .transpose()
 }

@@ -6,8 +6,11 @@ Gem::Specification.new do |spec|
   spec.version = HandoffMachines::VERSION
   spec.authors = ['Abdelkader Boudih']
   spec.email = ['oss@seuros.com']
-  spec.summary = 'Initial native partition handoff phases with generation-tagged acknowledgements'
-  spec.description = 'Local unstable transfer coordinator policy, not a rebalancer or lease authority.'
+  spec.summary = 'Partition handoff phases with generation-tagged acknowledgements for Ruby'
+  spec.description = 'Moves a partition between replicas one acknowledged phase at a time: quiesce, ' \
+                     'drain, checkpoint, then activate the target under a newer fencing token. Bound ' \
+                     'to Ruby from the no_std handoff-machines crate: the coordinator policy only, ' \
+                     'not a rebalancer or a lease authority.'
   spec.homepage = 'https://github.com/seuros/handoff_machines'
   spec.license = 'MIT'
   spec.required_ruby_version = '>= 4.0.0'

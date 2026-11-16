@@ -54,7 +54,7 @@ class HandoffTest < Minitest::Test
 
   def test_construction_mirrors_the_core
     handoff = H::Handoff.new(LIMITS)
-    assert_equal [LIMITS, 0, 0], [handoff.limits, handoff.generation, handoff.active]
+    assert_equal [LIMITS, nil, 0], [handoff.limits, handoff.generation, handoff.active]
     restored = H::Handoff.restored(LIMITS, 0, 40)
     assert_equal [LIMITS, 40], [restored.limits, restored.generation]
     assert_equal H::Ticket.new(9, 41), restored.start(9, 1, 2, 10, tok(5), 0)
@@ -304,8 +304,8 @@ class HandoffTest < Minitest::Test
     handoff, ticket = begun
     [1.0, nil, '1', Float::NAN].each do |bad|
       assert_raises(TypeError) { H::Handoff.new(H::Limits.new(bad, 1)) }
-      assert_raises(TypeError) { H::Handoff.restored(LIMITS, 0, bad) }
-      assert_raises(TypeError) { H::Handoff.restored(LIMITS, bad, 0) }
+      assert_raises(TypeError) { H::Handoff.restored(LIMITS, 0, bad) } unless bad.nil?
+      assert_raises(TypeError) { H::Handoff.restored(LIMITS, bad, nil) }
       assert_raises(TypeError) { handoff.start(bad, 1, 2, 0, tok(1), 0) }
       assert_raises(TypeError) { handoff.start(1, 1, 2, 0, bad, 0) }
       assert_raises(TypeError) { handoff.quiesced(ticket, 1, 12, bad) }

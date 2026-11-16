@@ -85,16 +85,15 @@ class ValuesTest < Minitest::Test
     assert_raises(TypeError) { H::Order.new(ticket, one, Object.new) }
   end
 
-  # A recipient or an action is one argument with one message, whichever
-  # half refused it: RangeError for a Symbol, TypeError for anything else.
+  # A recipient or an action names what it takes when the value is of the
+  # wrong kind (TypeError), and names the Symbol when it reads back as none
+  # (RangeError), a data variant's name included.
   def test_a_refused_recipient_or_action_names_what_it_takes
     ticket = H::Ticket.new(9, 1)
     one = H::Replica.new(1)
     recipient = 'a recipient is :authority or a HandoffMachines::Replica'
-    assert_equal recipient, assert_raises(RangeError) { H::Order.new(ticket, :replica, :quiesce) }.message
     assert_equal recipient, assert_raises(TypeError) { H::Order.new(ticket, 1, :quiesce) }.message
     action = 'an action is :quiesce, :discard or an action Data (exactly its class)'
-    assert_equal action, assert_raises(RangeError) { H::Order.new(ticket, one, :drain) }.message
     assert_equal action, assert_raises(TypeError) { H::Order.new(ticket, one, 'quiesce') }.message
     assert_equal action, assert_raises(TypeError) { H::Order.new(ticket, one, one) }.message
     error = assert_raises(TypeError) { H::Fence.new(6) }
@@ -102,6 +101,21 @@ class ValuesTest < Minitest::Test
     error = assert_raises(TypeError) { H::Order.new([9, 1], one, :quiesce) }
     assert_equal 'expected a HandoffMachines::Ticket', error.message
     assert_equal 'expected a HandoffMachines::Limits', assert_raises(TypeError) { H::Handoff.new([1, 1]) }.message
+  end
+
+  def test_an_unknown_recipient_symbol_is_named
+    ticket = H::Ticket.new(9, 1)
+    error = assert_raises(RangeError) { H::Order.new(ticket, :replica, :quiesce) }
+    assert_equal 'unknown recipient :replica', error.message
+    error = assert_raises(RangeError) { H::Order.new(ticket, :nobody, :quiesce) }
+    assert_equal 'unknown recipient :nobody', error.message
+  end
+
+  def test_an_unknown_action_symbol_is_named
+    ticket = H::Ticket.new(9, 1)
+    one = H::Replica.new(1)
+    assert_equal 'unknown action :drain', assert_raises(RangeError) { H::Order.new(ticket, one, :drain) }.message
+    assert_equal 'unknown action :nope', assert_raises(RangeError) { H::Order.new(ticket, one, :nope) }.message
   end
 
   def test_statuses

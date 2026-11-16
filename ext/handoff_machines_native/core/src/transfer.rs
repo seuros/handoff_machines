@@ -1,4 +1,4 @@
-use core::time::Duration;
+use core::{cmp::Ordering, num::NonZeroU64, time::Duration};
 
 use lease_machines::FencingToken;
 use offset_machines::{Ack, Commit, Tracker};
@@ -63,29 +63,34 @@ pub struct Transfer<const WORDS: usize> {
 ///
 /// Both are of the transfer's one token scope: `token` passed
 /// [`Transfer::homed`], and `floor` is the source token or the activation
-/// token `fenced` admitted. Within one scope a token's order is the order of
-/// its raw value, so there is no "of another scope" case left to answer here.
+/// token `fenced` admitted. The ranking is the token's own, which never orders
+/// tokens across scopes: tokens of two scopes are `Unknown` here too, the
+/// answer `homed` already gave, so no raw value is compared without its scope.
 const fn supersedes(token: FencingToken, floor: FencingToken) -> Result<(), Refusal> {
-    debug_assert!(
-        token.scope() == floor.scope(),
-        "both tokens are of the transfer's token scope"
-    );
-    if token.raw() > floor.raw() {
-        Ok(())
-    } else {
-        Err(Refusal::StaleToken)
+    match token.order(floor) {
+        Some(Ordering::Greater) => Ok(()),
+        Some(Ordering::Less | Ordering::Equal) => Err(Refusal::StaleToken),
+        None => Err(Refusal::Unknown),
     }
 }
 
+/// The drain tracker's one generation. The tracker belongs to one transfer
+/// and never meets another assignment: the ticket is checked before the
+/// tracker is reached, so the tracker needs no generation of its own beyond
+/// being assigned, and [`Tracker::assigned`] builds it so without a refusal.
+const DRAIN: NonZeroU64 = NonZeroU64::MIN;
+
 /// The answer for a drain-tracker refusal the transfer rules out: the tracker
-/// runs under the ticket's own (never zero) generation and is only asked to
-/// acknowledge or confirm, so neither `Stale` nor `Exhausted` can come back,
-/// and `ack` never answers `Unacked`. Refused as `OutOfPhase`, the most
-/// conservative answer; the tracker refused, so nothing changed.
+/// is assigned at construction and only ever asked under its own current
+/// generation, so `Stale` cannot come back; it is only asked to acknowledge
+/// or confirm, so `Exhausted` cannot either, and `ack` never answers
+/// `Unacked` nor `mark_committed` `OutOfWindow`. The tracker's one `Refusal`
+/// type still names them. Refused as `OutOfPhase`, the most conservative
+/// answer; the tracker refused, so nothing changed.
 fn untracked() -> Refusal {
     debug_assert!(
         false,
-        "the drain tracker runs under the ticket's generation"
+        "the drain tracker is asked only under its current generation"
     );
     Refusal::OutOfPhase
 }
@@ -103,17 +108,15 @@ const fn replay(holder: bool, same: bool) -> Result<Next, Refusal> {
 }
 
 impl<const WORDS: usize> Transfer<WORDS> {
-    pub fn new(
+    pub const fn new(
         ticket: Ticket,
         source: u64,
         target: u64,
         base: u64,
         source_token: FencingToken,
         deadline: Duration,
-    ) -> Option<Self> {
-        let mut tracker = Tracker::new();
-        tracker.assign(ticket.generation, base).ok()?;
-        Some(Self {
+    ) -> Self {
+        Self {
             ticket,
             source,
             target,
@@ -124,8 +127,8 @@ impl<const WORDS: usize> Transfer<WORDS> {
             checkpoint: None,
             token: None,
             installed: false,
-            tracker,
-        })
+            tracker: Tracker::assigned(DRAIN, base),
+        }
     }
 
     pub const fn involves(&self, replica: u64) -> bool {
@@ -268,7 +271,7 @@ impl<const WORDS: usize> Transfer<WORDS> {
                 Err(Refusal::OutOfPhase)
             };
         }
-        match self.tracker.ack(self.ticket.generation, offset) {
+        match self.tracker.ack(DRAIN.get(), offset) {
             Ok(Ack::Duplicate) => return Ok(Next::Repeat),
             Ok(Ack::Recorded) => {}
             Err(offset_machines::Refusal::OutOfWindow) => return Err(Refusal::OutOfWindow),
@@ -303,7 +306,7 @@ impl<const WORDS: usize> Transfer<WORDS> {
                 Err(Refusal::OutOfPhase)
             };
         }
-        match self.tracker.mark_committed(self.ticket.generation, offset) {
+        match self.tracker.mark_committed(DRAIN.get(), offset) {
             Ok(Commit::Duplicate) => Ok(Next::Repeat),
             Ok(Commit::Advanced) => Ok(Next::Same),
             Err(offset_machines::Refusal::Unacked) => Err(Refusal::Unacked),

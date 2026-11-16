@@ -4,7 +4,7 @@
 
 Engine-room flight manual: move a partition between replicas one acknowledged phase at a time.
 
-Initial, unstable. Allocation-free `no_std` coordinator policy for partition
+Allocation-free `no_std` coordinator policy for partition
 ownership transfer: quiesce the source, drain what is in flight, checkpoint,
 then activate the target under a newer fencing token. `Handoff<N, WORDS>` holds
 at most `N` concurrent transfers, each with a drain window of `WORDS * 64`
@@ -35,12 +35,13 @@ issue fencing tokens, send messages or persist anything.
   outlived a restart could name a new transfer. Either resume the sequence,
   or give each incarnation a scope no earlier one used.
   `Handoff::restored(limits, scope, last_generation)` resumes: it takes the
-  scope and what `generation()` answered, and is `None` when that value is
-  not of `scope`. The scope is never read out of the saved value, so one
-  that lost its top bits, or the `0` a store answers for a missing row,
-  cannot land a coordinator in scope zero. "Nothing issued yet" is spelled
-  one way, `scope` above a zero sequence, which is what `generation()`
-  answers then; with no saved value, call `with_scope`.
+  scope and what `generation()` answered, an `Option<u64>`, and is `None`
+  when a saved value is not a generation of `scope`. The scope is never read
+  out of the saved value, so one that lost its top bits, or the `0` a store
+  answers for a missing row, cannot land a coordinator in scope zero (`0` is
+  no generation there either). "Nothing issued yet" is spelled one way,
+  `None`, which is what `generation()` answers then and restores an equal
+  fresh coordinator.
 - An idempotent repeat (`Acked::Duplicate`) is answered only from a live
   transfer whose ticket matches, scope included. A ticket whose transfer
   ended is `Stale` even though the coordinator can tell it issued it: it does
@@ -67,8 +68,10 @@ issue fencing tokens, send messages or persist anything.
   the authority came back under a new scope before `fenced`, give the
   transfer up with an unfenced `abort` and start it again under a source
   token of the new scope.
-- Drain readiness is an `offset-machines` `Tracker` per transfer, assigned at the
-  transfer's generation: the phase ends when the contiguous acknowledged prefix
+- Drain readiness is an `offset-machines` `Tracker` per transfer, built
+  already assigned (`Tracker::assigned`) at the transfer's base: the ticket
+  is checked before the tracker is reached, so the tracker keeps one
+  generation of its own and never meets another. The phase ends when the contiguous acknowledged prefix
   reaches the quiesce point. `committed` slides the window for drains wider
   than it; `outstanding` lists what is still missing, resumably.
 - `abort` works from every phase and moves to `Rollback`: the source owes
@@ -101,16 +104,21 @@ issue fencing tokens, send messages or persist anything.
   accessors named after the fields.
   `Phase::is_final` says whether a phase ends a transfer.
 - **No unreachable arms.** Each step carries what its order restates, so an
-  order is never missing a field. Tokens reach `supersedes` only after their
-  scope was checked, so it compares raw values. Two arms remain that the
-  types demand and the invariants rule out, each a `debug_assert!` with the
-  most conservative refusal and nothing changed: a fresh drain tracker
-  refusing the transfer's issued generation (`start` answers `Exhausted`;
-  the generation is issued on a copy and kept only once the transfer
-  exists), and the drain tracker refusing an `ack` or a `mark_committed`
-  for a reason the transfer rules out, such as `Stale` under the ticket's own
-  generation (`OutOfPhase`). `restored` returns `None` under a
-  `debug_assert!` if a sequence taken out of an id were past the last.
+  order is never missing a field. A transfer is built without a refusal:
+  `Tracker::assigned` takes a generation that is never zero, so `start` has
+  no arm for a fresh drain tracker refusing. `restored` carries
+  `periscope-machines`' `Issuer::restored` whole, whose only refusals are the
+  two **Restarts** names (another scope, a zero sequence), so no sequence
+  can fall out of reach. Tokens are ranked with
+  `FencingToken::order`, which has no answer across scopes: `supersedes`
+  answers `Unknown` there, the answer `homed` already gave, and never
+  compares raw values of two scopes. One arm remains that the types demand
+  and the invariants rule out, a `debug_assert!` with the most conservative
+  refusal and nothing changed: the drain tracker refusing an `ack` or a
+  `mark_committed` for a reason the transfer rules out (`OutOfPhase`).
+  The tracker is asked only under its own current generation, so `Stale`
+  cannot come back, but its one `Refusal` type still names it, `Exhausted`,
+  and the variant the other call answers.
   Nothing in the crate panics.
 - Every call that can refuse returns `Result<T, Refusal>`. `Refusal` is the one
   enum for "not honoured", and a refused call changes nothing. No public enum

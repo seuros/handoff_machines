@@ -210,9 +210,10 @@ module HandoffMachines
       def with_scope(limits, scope) = native_with_scope(limits, scope)
 
       # Generations of `scope` above `last_generation`: what #generation
-      # answered on the previous coordinator of this namespace. RangeError when
-      # `last_generation` is of another scope, a bare 0 for a non-zero scope
-      # included: with nothing saved, call with_scope.
+      # answered on the previous coordinator of this namespace, nil when it had
+      # issued nothing. RangeError when `last_generation` is not a generation
+      # of `scope`: another scope's, one that lost its top bits, or a bare 0
+      # (no generation in any scope).
       def restored(limits, scope, last_generation) = native_restored(limits, scope, last_generation)
 
       private :native_with_scope, :native_restored, :native_scope_of

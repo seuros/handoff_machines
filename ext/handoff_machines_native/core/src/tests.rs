@@ -1,10 +1,11 @@
-#![allow(clippy::unwrap_used)] // Failed test assumptions should panic.
 use std::vec::Vec;
 
 use matryona_machines::testing::{refuses, unchanged};
+use periscope_machines::scoped;
 
 use super::*;
 
+mod construction;
 mod draws;
 mod edges;
 mod model;
@@ -322,7 +323,7 @@ fn concurrent_transfers_are_bounded_by_slots_and_per_replica() {
     assert_eq!(h.start(3, 7, 8, 0, token(1), at(0)), Err(Refusal::Full));
     h.resumed(a, 1, at(0)).unwrap();
     let c = h.start(3, 7, 8, 0, token(1), at(0)).unwrap();
-    assert_eq!((c.generation, h.generation()), (3, 3));
+    assert_eq!((c.generation, h.generation()), (3, Some(3)));
 
     let mut wide = Handoff::<4, 1>::new(LIMITS);
     wide.start(1, 1, 2, 0, token(1), at(0)).unwrap();

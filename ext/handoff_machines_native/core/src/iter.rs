@@ -32,6 +32,8 @@ impl<const WORDS: usize> Iterator for Orders<'_, WORDS> {
     fn next(&mut self) -> Option<Order> {
         while let Some(slot) = self.slots.get(self.position / 2) {
             let part = self.position % 2;
+            // position / 2 indexes a slice of non-zero-sized slots, so
+            // position < 2 * len <= isize::MAX * 2 and the step cannot wrap.
             self.position += 1;
             let order = slot.as_ref().and_then(|transfer| {
                 let (to, action) = transfer.order(part)?;

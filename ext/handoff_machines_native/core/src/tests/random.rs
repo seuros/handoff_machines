@@ -315,7 +315,7 @@ impl Run {
 
     fn compare(&self) {
         assert_eq!(self.core.active(), self.model.moves.len());
-        let issued = scoped(self.model.scope, self.model.issued);
+        let issued = (self.model.issued > 0).then(|| scoped(self.model.scope, self.model.issued));
         assert_eq!(self.core.generation(), issued);
         assert_eq!(self.core.scope(), self.model.scope);
         for partition in 0..6 {

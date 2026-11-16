@@ -33,7 +33,7 @@ class ScopeTest < Minitest::Test
 
   def test_new_is_scope_zero_and_issues_the_plain_counter
     handoff = H::Handoff.new(LIMITS)
-    assert_equal [0, 0], [handoff.scope, handoff.generation]
+    assert_equal [0, nil], [handoff.scope, handoff.generation]
     first = handoff.start(1, 1, 2, 0, tok(1), 0)
     second = handoff.start(2, 3, 4, 0, tok(1), 0)
     assert_equal [1, 2, 0], [first.generation, second.generation, first.scope]
@@ -42,7 +42,7 @@ class ScopeTest < Minitest::Test
   def test_with_scope_stamps_every_ticket
     handoff = H::Handoff.with_scope(LIMITS, 9)
     stamp = 9 << 48
-    assert_equal [9, stamp, LIMITS], [handoff.scope, handoff.generation, handoff.limits]
+    assert_equal [9, nil, LIMITS], [handoff.scope, handoff.generation, handoff.limits]
     ticket = handoff.start(9, 1, 2, 10, tok(5), 0)
     assert_equal [stamp | 1, 9], [ticket.generation, ticket.scope]
     assert_equal [ticket, ticket], [handoff.status(9).ticket, handoff.orders(0, 4).first.first.ticket]
@@ -76,7 +76,7 @@ class ScopeTest < Minitest::Test
     [0, 9, 65_535].each do |scope|
       fresh = H::Handoff.with_scope(LIMITS, scope)
       again = H::Handoff.restored(LIMITS, scope, fresh.generation)
-      assert_equal [scope, scope << 48, LIMITS], [again.scope, again.generation, again.limits]
+      assert_equal [scope, nil, LIMITS], [again.scope, again.generation, again.limits]
       old = fresh.start(9, 1, 2, 10, tok(5), 0)
       again = H::Handoff.restored(LIMITS, scope, fresh.generation)
       assert_equal [scope, old.generation], [again.scope, again.generation]
@@ -90,12 +90,14 @@ class ScopeTest < Minitest::Test
     handoff = H::Handoff.with_scope(LIMITS, 9)
     handoff.start(9, 1, 2, 10, tok(5), 0)
     saved = handoff.generation
-    # A missing row read as 0, a value cut to 32 bits, and another scope's.
-    [[9, 0], [65_535, 0], [9, saved & 0xFFFF_FFFF], [0, saved], [8, saved], [0, 9 << 48]].each do |scope, bad|
+    # A missing row read as 0 (in scope zero too: 0 is no generation), a value
+    # cut to 32 bits, another scope's, and a scope above a zero sequence.
+    [[9, 0], [65_535, 0], [0, 0], [9, saved & 0xFFFF_FFFF], [0, saved], [8, saved], [0, 9 << 48],
+     [9, 9 << 48]].each do |scope, bad|
       error = assert_raises(RangeError) { H::Handoff.restored(LIMITS, scope, bad) }
       assert_equal 'last_generation is not a generation of this scope', error.message
     end
-    [-1, 65_536].each { |bad| assert_raises(RangeError) { H::Handoff.restored(LIMITS, bad, 0) } }
+    [-1, 65_536].each { |bad| assert_raises(RangeError) { H::Handoff.restored(LIMITS, bad, nil) } }
     assert_raises(ArgumentError) { H::Handoff.restored(LIMITS, saved) }
   end
 

@@ -9,6 +9,7 @@ require_relative 'support'
 # never reaches the core.
 class ForgedTest < Minitest::Test
   include Forge
+  include Redefining
 
   H = HandoffMachines
   LIMITS = H::Limits.new(5_000_000_000, 2)
@@ -47,9 +48,7 @@ class ForgedTest < Minitest::Test
       assert_raises(TypeError) { eval(source) } # rubocop:disable Security/Eval
     end
     klass = ForgedTest.const_get(name)
-    klass.class_eval do
-      define_method(:initialize) { |**fields| Data.instance_method(:initialize).bind_call(self, **fields) }
-    end
+    replace_method(klass, :initialize, proc { |**fields| Data.instance_method(:initialize).bind_call(self, **fields) })
     klass
   end
 
@@ -124,13 +123,13 @@ class ForgedTest < Minitest::Test
                 H::Ticket => %i[partition generation], H::Replica => %i[id], H::Drain => %i[until] }
     originals = readers.flat_map { |klass, names| names.map { [klass, it, klass.instance_method(it)] } }
     begin
-      originals.each { |klass, name, _| klass.define_method(name) { raise "#{name} reader ran" } }
+      originals.each { |klass, name, _| replace_method(klass, name, proc { raise "#{name} reader ran" }) }
       quiesced = handoff.quiesced(ticket, 1, 12, 1)
       other = H::Handoff.new(LIMITS)
       started = other.start(9, 1, 2, 10, tok(5), 0)
       rebuilt = H::Order.new(order.ticket, order.to, order.action)
     ensure
-      originals.each { |klass, name, reader| klass.define_method(name, reader) }
+      originals.each { |klass, name, reader| replace_method(klass, name, (reader if reader.owner == klass)) }
     end
     assert_equal H::Recorded.new(:drain), quiesced
     assert_equal ticket, started

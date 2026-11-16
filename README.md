@@ -37,7 +37,7 @@ handoff.activated(ticket, 2, granted, clock.now) # => Recorded(:complete)
 
 One coordinator, one method per acknowledgement. The Ruby API is the core's, name for name: `HandoffMachines::Handoff` is the core's `Handoff`, every `Data` value has the fields of the core struct or enum variant it mirrors, and arguments come in the core's order. Partitions, replicas, offsets and checkpoints are Integers; fencing tokens are `FencingToken` values. Time is Integer nanoseconds on one monotonic clock, `Process.clock_gettime(Process::CLOCK_MONOTONIC, :nanosecond)`, for instants (`now`, `deadline`) and spans (`phase_budget`) alike. No floats, no milliseconds, no `Time.now`.
 
-This is an initial release with an unstable API. It is a policy core, not a runtime: it sends nothing, stores nothing and issues no tokens.
+It is a policy core, not a runtime: it sends nothing, stores nothing and issues no tokens.
 
 ## A Message to the Resistance
 
@@ -335,7 +335,7 @@ A `Duplicate` carries the phase the transfer stands at now: any phase from the o
 
 **Which answers record the clock.** An honoured call records `now` exactly when its answer depends on it. `start` and every acknowledgement that moves the transfer to a new wait do: the new phase's deadline is `now + phase_budget`. A `Duplicate`, a `Recorded(:drain)` within the drain, a `committed`, a step within the rollback and the acknowledgement that ends the transfer answer the same at any instant and record nothing, so a later call with an earlier `now` is not `:clock_regressed` because of them. `overdue(now, ..)` is a query and records nothing either.
 
-`Handoff.new(limits)`, `Handoff.with_scope(limits, scope)`, `limits`, `scope`, `status`, `orders`, `overdue`, `active` and `generation` never refuse. `Handoff.restored(limits, scope, last_generation)` answers a coordinator or raises `RangeError` when `last_generation` is not a generation of `scope`.
+`Handoff.new(limits)`, `Handoff.with_scope(limits, scope)`, `limits`, `scope`, `status`, `orders`, `overdue`, `active` and `generation` never refuse. `Handoff.restored(limits, scope, last_generation)` answers a coordinator or raises `RangeError` when `last_generation` is neither `nil` nor a generation of `scope`.
 
 ## The Rules of the Tender
 
@@ -370,7 +370,7 @@ Before the checkpoint, cancelling means telling the source to carry on. After th
 
 ## What's Yours
 
-The coordinator lives in your process and forgets everything when the process does. A fresh coordinator counts from 1 again, so a ticket that outlived a restart could name a new transfer. Either resume the sequence or give each incarnation a scope no earlier one used. To resume, write `generation` somewhere durable before you hand out a ticket, and build the next coordinator with `Handoff.restored(limits, scope, last_generation)` so old tickets stay old. The scope is yours to pass, never read out of the saved value: a value from another scope, one that lost its top bits, or a bare `0` for a non-zero scope raises `RangeError`. A coordinator that issued nothing answers `scope << 48`, and that is the only spelling of "nothing issued yet"; with no saved row at all, call `Handoff.with_scope`. Transfers that were in flight are not restored: start them again, and let your lease authority's highest token decide who owns a partition that was mid-activation.
+The coordinator lives in your process and forgets everything when the process does. A fresh coordinator counts from 1 again, so a ticket that outlived a restart could name a new transfer. Either resume the sequence or give each incarnation a scope no earlier one used. To resume, write `generation` somewhere durable before you hand out a ticket, and build the next coordinator with `Handoff.restored(limits, scope, last_generation)` so old tickets stay old. The scope is yours to pass, never read out of the saved value: a value from another scope, one that lost its top bits, or a bare `0` (no generation in any scope, scope zero included) raises `RangeError`. A coordinator that issued nothing answers `nil`, and that is the only spelling of "nothing issued yet": store it as a null and `restored` gives you back an equal fresh coordinator. Transfers that were in flight are not restored: start them again, and let your lease authority's highest token decide who owns a partition that was mid-activation.
 
 Replica ids are whatever you say they are. The coordinator compares them and cannot tell a restarted replica from an impostor. Fencing tokens must come from one serialized authority, and the resource they protect has to reject older ones atomically with each write. If you abort without a token while the authority might already have granted the target one, report the grant with `fenced` first.
 

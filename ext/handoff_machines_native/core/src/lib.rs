@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(not(test), deny(clippy::indexing_slicing))]
 #![doc = include_str!("../README.md")]
 
 mod iter;
@@ -10,7 +11,7 @@ use core::time::Duration;
 
 pub use iter::{Orders, Outstanding, Overdue};
 pub use lease_machines::FencingToken;
-use periscope_machines::{Issuer, scope_of, scoped, sequence_of};
+use periscope_machines::Issuer;
 pub use refusal::Refusal;
 use transfer::{Next, Transfer};
 pub use types::{Acked, Action, Limits, Order, Phase, Recipient, Status, Ticket};
@@ -58,29 +59,27 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
 
     /// Start with no transfers in `scope`, issuing generations above
     /// `last_generation`: what [`Handoff::generation`] answered on the
-    /// previous coordinator of this namespace.
+    /// previous coordinator of this namespace, `None` when it had issued
+    /// nothing (an equal coordinator to [`Handoff::with_scope`]).
     ///
     /// The scope is the caller's, never read out of the saved value, and the
-    /// saved value must carry it: `None` when `last_generation` is of another
-    /// scope. So a value that lost its top bits, or the `0` a store answers
-    /// for a row that is not there, cannot put a coordinator of a non-zero
-    /// scope into scope zero. The one value that means "nothing issued yet"
-    /// is `scope` above a zero sequence, which is what `generation()` answers
-    /// then; it is `0` only in scope zero. With no saved value at all, call
-    /// [`Handoff::with_scope`].
+    /// saved value must be a generation of it: `None` when `last_generation`
+    /// is of another scope or carries a zero sequence. So a value that lost
+    /// its top bits, or the `0` a store answers for a row that is not there,
+    /// cannot put a coordinator of a non-zero scope into scope zero, and `0`
+    /// is no generation in scope zero either. Those are the only refusals:
+    /// [`Issuer::restored`] answers exactly them, and `None` is its answer
+    /// carried whole.
     #[must_use]
-    pub const fn restored(limits: Limits, scope: u16, last_generation: u64) -> Option<Self> {
-        if scope_of(last_generation) != scope {
-            return None;
+    pub const fn restored(
+        limits: Limits,
+        scope: u16,
+        last_generation: Option<u64>,
+    ) -> Option<Self> {
+        match Issuer::restored(scope, last_generation) {
+            Some(generations) => Some(Self::resuming(limits, generations)),
+            None => None,
         }
-        let Some(generations) = Issuer::resumed(scope, sequence_of(last_generation)) else {
-            debug_assert!(
-                false,
-                "a sequence taken out of an id is never past the last"
-            );
-            return None;
-        };
-        Some(Self::resuming(limits, generations))
     }
 
     const fn resuming(limits: Limits, generations: Issuer) -> Self {
@@ -98,18 +97,16 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
         self.generations.scope()
     }
 
-    /// Highest generation issued so far; persist it before exposing a ticket.
+    /// Highest generation issued so far, `None` before the first; persist it
+    /// before exposing a ticket.
     ///
-    /// Before the first, it is the scope alone above a zero sequence:
-    /// `scope << 48`, which is zero only in scope zero. That value is not a
-    /// generation (no ticket carries it, and a ticket made from it is
-    /// [`Refusal::Unknown`]), so read "nothing issued yet" from its sequence,
-    /// not by comparing it with zero. Persist the whole `u64` beside
-    /// [`Handoff::scope`]: [`Handoff::restored`] takes both and refuses a
-    /// value that is not of that scope.
+    /// The whole generation, scope included. Persist it beside
+    /// [`Handoff::scope`] (a nullable column: `None` is "nothing issued
+    /// yet"): [`Handoff::restored`] takes both and refuses a value that is
+    /// not a generation of that scope.
     #[must_use]
-    pub const fn generation(&self) -> u64 {
-        scoped(self.generations.scope(), self.generations.issued())
+    pub const fn generation(&self) -> Option<u64> {
+        self.generations.last()
     }
 
     /// Number of transfers in progress.
@@ -172,12 +169,14 @@ impl<const N: usize, const WORDS: usize> Handoff<N, WORDS> {
             partition,
             generation,
         };
-        let Some(transfer) = Transfer::new(ticket, source, target, base, source_token, deadline)
-        else {
-            debug_assert!(false, "a fresh drain tracker accepts any issued generation");
-            return Err(Refusal::Exhausted);
-        };
-        *slot = Some(transfer);
+        *slot = Some(Transfer::new(
+            ticket,
+            source,
+            target,
+            base,
+            source_token,
+            deadline,
+        ));
         self.generations = generations;
         self.observed = now;
         Ok(ticket)

@@ -80,12 +80,12 @@ fn two_coordinators_left_in_one_scope_still_alias() {
 fn scope_zero_issues_the_plain_counter() {
     let mut h = Small::new(LIMITS);
     assert_eq!(h, Small::with_scope(LIMITS, 0));
-    assert_eq!(Some(&h), Small::restored(LIMITS, 0, 0).as_ref());
-    assert_eq!((h.scope(), h.generation()), (0, 0));
+    assert_eq!(Some(&h), Small::restored(LIMITS, 0, None).as_ref());
+    assert_eq!((h.scope(), h.generation()), (0, None));
     let first = h.start(1, 1, 2, 0, token(1), at(0)).unwrap();
     let second = h.start(2, 3, 4, 0, token(1), at(0)).unwrap();
     assert_eq!((first.generation, second.generation), (1, 2));
-    assert_eq!((first.scope(), h.generation()), (0, 2));
+    assert_eq!((first.scope(), h.generation()), (0, Some(2)));
 }
 
 #[test]
@@ -93,18 +93,18 @@ fn a_restored_coordinator_keeps_its_scope_and_its_sequence() {
     let (mut h, old) = begun_in(9);
     assert_eq!((h.scope(), old.scope()), (9, 9));
     assert_eq!(
-        (old.generation, h.generation()),
-        (scoped(9, 1), scoped(9, 1))
+        (Some(old.generation), h.generation()),
+        (Some(scoped(9, 1)), Some(scoped(9, 1)))
     );
-    assert_eq!(Small::with_scope(LIMITS, 9).generation(), scoped(9, 0));
+    assert_eq!(Small::with_scope(LIMITS, 9).generation(), None);
     assert_eq!(
         Some(Small::with_scope(LIMITS, 9)),
-        Small::restored(LIMITS, 9, scoped(9, 0))
+        Small::restored(LIMITS, 9, None)
     );
     assert_eq!(h.abort(old, None, at(0)), recorded(Phase::Rollback));
 
     let mut again = Small::restored(LIMITS, 9, h.generation()).unwrap();
-    assert_eq!((again.scope(), again.generation()), (9, scoped(9, 1)));
+    assert_eq!((again.scope(), again.generation()), (9, Some(scoped(9, 1))));
     // Issued before the restart, not live now: stale, not unknown.
     refuses_everywhere(&mut again, old, Refusal::Stale);
     let next = again.start(9, 1, 2, 10, token(5), at(0)).unwrap();
@@ -124,7 +124,7 @@ fn a_restored_coordinator_keeps_its_scope_and_its_sequence() {
 
 #[test]
 fn the_last_generation_is_issued_then_the_scope_is_spent() {
-    let mut h = Small::restored(LIMITS, 0, SEQUENCE_MAX - 1).unwrap();
+    let mut h = Small::restored(LIMITS, 0, Some(SEQUENCE_MAX - 1)).unwrap();
     assert_eq!(h.scope(), 0);
     let last = h.start(1, 1, 2, 0, token(1), at(3)).unwrap();
     assert_eq!((last.generation, last.scope()), (SEQUENCE_MAX, 0));
@@ -132,7 +132,7 @@ fn the_last_generation_is_issued_then_the_scope_is_spent() {
     refuses(&mut h, Refusal::Exhausted, |s| {
         s.start(2, 3, 4, 0, token(1), at(7))
     });
-    assert_eq!((h.scope(), h.generation()), (0, SEQUENCE_MAX));
+    assert_eq!((h.scope(), h.generation()), (0, Some(SEQUENCE_MAX)));
     // Another refusal comes first and still spends nothing.
     refuses(&mut h, Refusal::Busy, |s| {
         s.start(1, 3, 4, 0, token(1), at(7))
@@ -140,7 +140,7 @@ fn the_last_generation_is_issued_then_the_scope_is_spent() {
     // The ticket already issued still works.
     assert_eq!(h.quiesced(last, 1, 0, at(3)), recorded(Phase::Checkpoint));
 
-    let mut spent = Small::restored(LIMITS, 0, SEQUENCE_MAX).unwrap();
+    let mut spent = Small::restored(LIMITS, 0, Some(SEQUENCE_MAX)).unwrap();
     refuses(&mut spent, Refusal::Exhausted, |s| {
         s.start(1, 1, 2, 0, token(1), at(0))
     });
@@ -149,16 +149,15 @@ fn the_last_generation_is_issued_then_the_scope_is_spent() {
 #[test]
 fn restoring_from_generation_continues_where_the_coordinator_stopped() {
     for scope in [0, 9, u16::MAX] {
-        // Fresh: nothing issued, so the answer is the scope above sequence
-        // zero. It is not a generation, and it restores an equal coordinator.
+        // Fresh: nothing issued, so no generation, in every scope alike,
+        // and that answer restores an equal coordinator.
         let fresh = Small::with_scope(LIMITS, scope);
-        assert_eq!(fresh.generation(), scoped(scope, 0));
-        assert_eq!(fresh.generation() == 0, scope == 0);
+        assert_eq!(fresh.generation(), None);
         let mut again = Small::restored(LIMITS, scope, fresh.generation()).unwrap();
         assert_eq!(again, fresh);
         let never = Ticket {
             partition: 9,
-            generation: fresh.generation(),
+            generation: scoped(scope, 0),
         };
         refuses_everywhere(&mut again, never, Refusal::Unknown);
         let first = again.start(9, 1, 2, 10, token(5), at(0)).unwrap();
@@ -166,7 +165,7 @@ fn restoring_from_generation_continues_where_the_coordinator_stopped() {
 
         // Used: the restored coordinator issues what the old one would have.
         let (mut used, old) = begun_in(scope);
-        assert_eq!(used.generation(), scoped(scope, 1));
+        assert_eq!(used.generation(), Some(scoped(scope, 1)));
         let mut again = Small::restored(LIMITS, scope, used.generation()).unwrap();
         assert_eq!(
             (again.scope(), again.generation(), again.active()),
@@ -183,11 +182,18 @@ fn restoring_from_generation_continues_where_the_coordinator_stopped() {
 
 #[test]
 fn the_last_generation_of_a_scope_restores_a_spent_coordinator() {
-    let mut h = Small::restored(LIMITS, u16::MAX, scoped(u16::MAX, SEQUENCE_MAX - 1)).unwrap();
+    let mut h =
+        Small::restored(LIMITS, u16::MAX, Some(scoped(u16::MAX, SEQUENCE_MAX - 1))).unwrap();
     let last = h.start(1, 1, 2, 0, token(1), at(3)).unwrap();
-    assert_eq!((last.generation, h.generation()), (u64::MAX, u64::MAX));
+    assert_eq!(
+        (Some(last.generation), h.generation()),
+        (Some(u64::MAX), Some(u64::MAX))
+    );
     let mut spent = Small::restored(LIMITS, u16::MAX, h.generation()).unwrap();
-    assert_eq!((spent.scope(), spent.generation()), (u16::MAX, u64::MAX));
+    assert_eq!(
+        (spent.scope(), spent.generation()),
+        (u16::MAX, Some(u64::MAX))
+    );
     refuses(&mut spent, Refusal::Exhausted, |s| {
         s.start(2, 3, 4, 0, token(1), at(7))
     });
@@ -196,24 +202,27 @@ fn the_last_generation_of_a_scope_restores_a_spent_coordinator() {
 
 #[test]
 fn restoring_refuses_a_saved_value_of_another_scope() {
-    // The review's three inputs. A store that answers 0 for a missing row:
-    assert_eq!(Small::restored(LIMITS, 9, 0), None);
-    assert_eq!(Small::restored(LIMITS, u16::MAX, 0), None);
+    // The review's three inputs. A store that answers 0 for a missing row,
+    // in any scope, scope zero included: 0 is no generation.
+    assert_eq!(Small::restored(LIMITS, 9, Some(0)), None);
+    assert_eq!(Small::restored(LIMITS, u16::MAX, Some(0)), None);
+    assert_eq!(Small::restored(LIMITS, 0, Some(0)), None);
     // A saved value cut to 32 bits, which would alias a scope-zero coordinator:
     let (h, _) = begun_in(9);
-    let cut = h.generation() & 0xFFFF_FFFF;
+    let cut = h.generation().map(|generation| generation & 0xFFFF_FFFF);
     assert_eq!(begun_in(0).0.generation(), cut);
     assert_eq!(Small::restored(LIMITS, 9, cut), None);
     // And the scope is never the saved value's: each side refuses the other's.
     assert_eq!(Small::restored(LIMITS, 0, h.generation()), None);
     assert_eq!(Small::restored(LIMITS, 8, h.generation()), None);
-    assert_eq!(Small::restored(LIMITS, 0, scoped(9, 0)), None);
     for scope in [0, 9, u16::MAX] {
-        // "Nothing issued yet" is spelled one way: the scope above sequence zero.
-        let fresh = Small::restored(LIMITS, scope, scoped(scope, 0));
+        // "Nothing issued yet" is spelled one way, `None`; the scope above
+        // sequence zero is no generation and is refused.
+        let fresh = Small::restored(LIMITS, scope, None);
         assert_eq!(fresh, Some(Small::with_scope(LIMITS, scope)));
+        assert_eq!(Small::restored(LIMITS, scope, Some(scoped(scope, 0))), None);
         for other in [1, 10, u16::MAX - 1] {
-            assert_eq!(Small::restored(LIMITS, scope, scoped(other, 1)), None);
+            assert_eq!(Small::restored(LIMITS, scope, Some(scoped(other, 1))), None);
         }
     }
 }

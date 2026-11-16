@@ -1,17 +1,8 @@
 //! Private native entry point.
-use crate::{
-    CAPACITY, Core, Handoff, classes, names, scope_of, token_newer, token_order, token_scope,
-    validate_raw, values,
-};
-use magnus::{Error, RArray, Ruby, function, method, prelude::*};
-use matryona_machines::ruby::Symbols;
-
-/// Every Symbol of a table, in its order, frozen.
-fn every<T: Symbols>(ruby: &Ruby) -> RArray {
-    let list = ruby.ary_from_iter(T::ALL.iter().map(|variant| T::symbol(ruby, *variant)));
-    list.freeze();
-    list
-}
+use crate::values::{self, Family};
+use crate::{CAPACITY, Core, Handoff, classes, names, scope_of};
+use magnus::{Error, Ruby, function, method, prelude::*};
+use matryona_machines::ruby::{Symbols, fencing};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -19,12 +10,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     classes::resolve(ruby, module)?;
     module.const_set("CAPACITY", CAPACITY)?;
     module.const_set("WINDOW", Core::WINDOW)?;
-    module.const_set("PHASES", every::<names::Phases>(ruby))?;
-    module.const_set("REFUSALS", every::<names::Refusals>(ruby))?;
-    module.define_singleton_method("native_raw", function!(validate_raw, 1))?;
-    module.define_singleton_method("native_token_scope", function!(token_scope, 1))?;
-    module.define_singleton_method("native_token_order", function!(token_order, 2))?;
-    module.define_singleton_method("native_token_newer", function!(token_newer, 2))?;
+    module.const_set("PHASES", names::Phases::every(ruby))?;
+    module.const_set("REFUSALS", names::Refusals::every(ruby))?;
+    let raw = function!(fencing::validate_raw::<Family>, 1);
+    module.define_singleton_method("native_raw", raw)?;
+    let scope = function!(fencing::token_scope::<Family>, 1);
+    module.define_singleton_method("native_token_scope", scope)?;
+    let order = function!(fencing::token_order::<Family>, 2);
+    module.define_singleton_method("native_token_order", order)?;
+    let newer = function!(fencing::token_newer::<Family>, 2);
+    module.define_singleton_method("native_token_newer", newer)?;
     module.define_singleton_method("__limits", function!(values::check_limits, 2))?;
     module.define_singleton_method("__ticket", function!(values::check_ticket, 2))?;
     module.define_singleton_method("__recorded", function!(values::check_recorded, 1))?;
@@ -33,7 +28,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     module.define_singleton_method("__drain", function!(values::check_drain, 1))?;
     module.define_singleton_method("__capture", function!(values::check_capture, 1))?;
     module.define_singleton_method("__install", function!(values::check_install, 1))?;
-    module.define_singleton_method("__token", function!(values::check_token, 1))?;
+    let token = function!(fencing::own_token::<Family>, 1);
+    module.define_singleton_method("__token", token)?;
     module.define_singleton_method("__order", function!(values::check_order, 3))?;
     module.define_singleton_method("__status", function!(values::check_status, 9))?;
     let class = module.define_class("Handoff", ruby.class_object())?;
