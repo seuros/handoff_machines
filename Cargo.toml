@@ -15,7 +15,7 @@ rb-sys = { version = "0.9.130", default-features = false, features = ["stable-ap
 lease-machines = ">=0.7"
 offset-machines = ">=0.6"
 periscope-machines = ">=0.5"
-matryona-machines = { version = ">=0.5", default-features = false }
+matryona-machines = { version = ">=0.6", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

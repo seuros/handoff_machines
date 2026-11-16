@@ -2,7 +2,7 @@
 use crate::values::{self, Family};
 use crate::{CAPACITY, Core, Handoff, classes, names, scope_of};
 use magnus::{Error, Ruby, function, method, prelude::*};
-use matryona_machines::ruby::{Symbols, fencing};
+use matryona_machines::ruby::{Class, Symbols, fencing};
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -56,5 +56,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_private_method("native_overdue", method!(Handoff::overdue, 3))?;
     class.define_method("active", method!(Handoff::active, 0))?;
     class.define_method("generation", method!(Handoff::generation, 0))?;
-    Ok(())
+    // `native_with_scope` and `native_restored` answer a Handoff: its class
+    // is fixed now, before either runs.
+    Class::pin_wrapped::<Handoff>(ruby, class).map(drop)
 }
